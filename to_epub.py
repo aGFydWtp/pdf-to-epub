@@ -1,0 +1,765 @@
+"""OCR JSON（book_ir の IR 経由）から EPUB3（日本語縦書き既定）を生成する。
+
+主な処理:
+  - book_ir.build_ir() で IR ブロック列を構築し、印刷目次ページを既定で除外
+  - 大見出しごとに XHTML を分割し、「部」「大見出し」「中見出し」の3階層 nav.xhtml を構築
+  - ｜親《ルビ》記法を <ruby><rt> へ変換
+  - 表セル構造を <table>（rowspan/colspan 付き）へ、図版を crop_figures で切り出して <img> へ
+  - PDF 1ページ目をカバー画像としてレンダリング
+  - 生成した EPUB を zip 構造・XML 整形式・manifest/spine 突合の観点で自己検証する
+"""
+
+import argparse
+import datetime
+import io
+import re
+import sys
+import tempfile
+import uuid
+import xml.etree.ElementTree as ET
+import zipfile
+from pathlib import Path
+from xml.sax.saxutils import escape
+
+from book_ir import KANJI_RE, build_ir, crop_figures, fix_subtitle_dash, join_lines, normalize_text
+
+# --------------------------------------------------------------------------
+# ルビ・インライン変換
+# --------------------------------------------------------------------------
+
+_KANJI_CLASS = KANJI_RE.pattern.strip("[]")
+RUBY_PIPE_RE = re.compile(r"｜([^｜《》]+)《([^《》]+)》")
+RUBY_BARE_RE = re.compile(f"([{_KANJI_CLASS}]+)《([^《》]+)》")
+
+
+def render_inline(text: str) -> str:
+    """本文中の｜親《ルビ》記法を <ruby><rt> タグへ変換する（エスケープ込み）。
+
+    エスケープはここで一度だけ行う。｜《》は XML エスケープの対象外の文字なので、
+    エスケープ後にルビ変換を行っても二重エスケープや取りこぼしは起きない。
+    """
+
+    escaped = escape(text)
+    escaped = RUBY_PIPE_RE.sub(lambda m: f"<ruby>{m.group(1)}<rt>{m.group(2)}</rt></ruby>", escaped)
+    escaped = RUBY_BARE_RE.sub(lambda m: f"<ruby>{m.group(1)}<rt>{m.group(2)}</rt></ruby>", escaped)
+    return escaped
+
+
+def escape_attr(text: str) -> str:
+    """XML 属性値へ埋め込むためのエスケープ。
+
+    xml.sax.saxutils.escape() は既定で " をエスケープしないため、属性値に
+    ダブルクォートを含むテキスト（OCR 由来の図版キャプション等）を埋め込むと
+    非整形式になる。属性値に動的なテキストを差し込む箇所は必ずこちらを使う。
+    """
+
+    return escape(text, {'"': "&quot;"})
+
+
+# --------------------------------------------------------------------------
+# 印刷目次の除外
+# --------------------------------------------------------------------------
+
+
+def filter_printed_toc(blocks: list[dict], keep: bool = False) -> list[dict]:
+    """既定では印刷目次（layout-pages で復元した「目次」見出し配下）を本文から除く。
+
+    索引ページは対象外（見出しが「目次」系でなければ除外は始まらない）。
+    """
+
+    if keep:
+        return blocks
+
+    out: list[dict] = []
+    skipping = False
+    for b in blocks:
+        if b["kind"] == "heading":
+            head = normalize_text(b["lines"][0]) if b["lines"] else ""
+            skipping = head in ("目次", "目 次")
+            if skipping:
+                continue
+        if skipping:
+            continue
+        out.append(b)
+    return out
+
+
+# --------------------------------------------------------------------------
+# 校正 fixes の適用
+# --------------------------------------------------------------------------
+
+
+def apply_fixes(blocks: list[dict], fixes: list[dict]) -> list[dict]:
+    """pdf_to_epub.py が生成する校正 fixes を IR に適用する。
+
+    fixes の各要素: {"page", "before", "after", "why"}（llm_proofread.py の適用結果と同形式）。
+    ブロック分割は章単位 OCR の都合で pdf_to_epub 内部と最終 IR とで完全には一致しない
+    ことがあるため、行番号ではなく「ページ番号 + before の一意性」で適用位置を特定する
+    （llm_proofread.validate() と同じ安全策）。
+
+    段落ブロックはページを跨いで連結されることがあり、ブロックの代表ページ（"page"）
+    だけでは行ごとの実際の所在ページとずれる場合がある。そのため、行ごとの実ページが
+    わかるブロック（"pages" を持つ para ブロック）はそちらを優先して使い、
+    見出し／raw のように 1 ブロック＝単一ページのものはブロックの "page" を使う。
+    それでも見つからない場合に限り、章単位 OCR とページ確定のわずかなずれを吸収する
+    ためページ ±1 を最終フォールバックとして試す（一致が複数になる場合は適用しない）。
+    """
+
+    blocks = [dict(b) for b in blocks]
+    by_page: dict[int, list[tuple[int, int]]] = {}
+    for bi, b in enumerate(blocks):
+        if b["kind"] in ("heading", "para"):
+            pages = b.get("pages") or [b["page"]] * len(b["lines"])
+            for li in range(len(b["lines"])):
+                page = pages[li] if li < len(pages) else b["page"]
+                by_page.setdefault(page, []).append((bi, li))
+        elif b["kind"] == "raw":
+            by_page.setdefault(b["page"], []).append((bi, -1))
+
+    def find_matches(page: int, before: str) -> list[tuple[int, int]]:
+        matches = []
+        for bi, li in by_page.get(page, []):
+            text = blocks[bi]["text"] if li == -1 else blocks[bi]["lines"][li]
+            if text.count(before) == 1:
+                matches.append((bi, li))
+        return matches
+
+    applied, skipped = 0, []
+    for fix in fixes:
+        page, before, after = fix.get("page"), fix.get("before", ""), fix.get("after", "")
+        if not before or page is None:
+            skipped.append((fix, "before が空、または page が未指定"))
+            continue
+
+        matches = find_matches(page, before)
+        via_fallback = False
+        if not matches:
+            # 章単位ビルドとフル IR とでページ跨ぎ段落の代表ページがずれるケースの
+            # 最終フォールバック。曖昧な適用を避けるため候補が複数出たら諦める。
+            fallback = [m for p in (page - 1, page + 1) for m in find_matches(p, before)]
+            if len(fallback) == 1:
+                matches, via_fallback = fallback, True
+
+        if len(matches) == 0:
+            skipped.append((fix, f"ページ {page}（±1 含む）に before が見つからない: {before!r}"))
+            continue
+        if len(matches) > 1:
+            skipped.append((fix, f"ページ {page} で before が複数箇所に一致: {before!r}"))
+            continue
+
+        bi, li = matches[0]
+        if li == -1:
+            blocks[bi]["text"] = blocks[bi]["text"].replace(before, after)
+        else:
+            lines = list(blocks[bi]["lines"])
+            lines[li] = lines[li].replace(before, after)
+            blocks[bi]["lines"] = lines
+        applied += 1
+        if via_fallback:
+            print(f"  校正 fix: ページ {page} で見つからず ±1 で適用: {before!r} → {after!r}")
+
+    print(f"校正 fixes 適用: {applied}/{len(fixes)} 件")
+    for fix, reason in skipped:
+        print(f"  スキップ: page={fix.get('page')} before={fix.get('before')!r} 理由={reason}")
+    return blocks
+
+
+# --------------------------------------------------------------------------
+# 章分割と階層目次の構築
+# --------------------------------------------------------------------------
+
+BU_HEADING_RE = re.compile(r"^第[ⅠⅡⅢⅣⅤ]部")
+# book_ir.heading_level() は「大見出しかどうか」（＝章として XHTML を分割すべきか）を
+# 判定するためのものだが、ここでの FRONT_BACK_TITLES は「大見出しの中でも部に
+# ぶら下げず常に nav の第1階層に置くべきもの」を選ぶための別基準であり、意図的に
+# heading_level() の判定基準と非対称（例: 「註」は大見出しだが FRONT_BACK_TITLES には
+# 含めない＝現在の部の下にネストさせたい）。二つを揃える必要はない。
+FRONT_BACK_TITLES = {
+    "はじめに", "あとがき", "おわりに", "目次", "目 次",
+    "索引", "事項索引", "人名索引", "文献一覧",
+}
+
+
+def heading_title(lines: list[str]) -> str:
+    """見出し行を nav・<title> 表示用の 1 行に連結する（render_heading と見た目を揃える）。
+
+    ダーシュで始まる副題行（fix_subtitle_dash が付与したもの）の前には全角空白を
+    挟まない（「……時間――観点による区別」のように直接続ける）。
+    """
+
+    parts = [normalize_text(l) for l in lines]
+    parts = [p for p in parts if p]
+    parts = fix_subtitle_dash(parts)
+    out = ""
+    for i, p in enumerate(parts):
+        if i > 0 and not p.startswith("――"):
+            out += "　"
+        out += p
+    return out
+
+
+def split_chapters_and_nav(blocks: list[dict]) -> tuple[list[dict], list[dict]]:
+    """IR を大見出しごとの章に分割し、同時に階層目次ツリーを構築する。
+
+    - 「第○部」見出しは第1階層。以後、次の部見出しが現れるまでの大見出しは
+      その部の第2階層として nest する（部がなければ大見出しは第1階層になる）
+    - はじめに・あとがき・目次・索引など前付/後付の大見出しは常に第1階層
+    - 中見出しは現在の章の nav ノードの子（第3階層）として登録し、id を振る
+    - 小見出しは id のみ振り、nav には含めない
+
+    戻り値: (chapters, nav_tree)
+      chapters: [{"file": "ch000.xhtml", "blocks": [...], "section_type": "part"|"chapter"}]
+      nav_tree: [{"title", "href", "children": [...]}, ...]
+    """
+
+    chapters: list[dict] = []
+    nav_tree: list[dict] = []
+    current_bu: dict | None = None
+    current_chapter_nav: dict | None = None
+    current_chapter: dict | None = None
+    heading_seq = 0
+
+    def ensure_chapter() -> dict:
+        nonlocal current_chapter
+        if current_chapter is None:
+            current_chapter = {
+                "file": f"ch{len(chapters):03d}.xhtml",
+                "blocks": [],
+                "section_type": "chapter",
+            }
+            chapters.append(current_chapter)
+        return current_chapter
+
+    for b in blocks:
+        if b["kind"] == "heading" and b["level"] == "大":
+            current_chapter = {
+                "file": f"ch{len(chapters):03d}.xhtml",
+                "blocks": [b],
+                "section_type": "chapter",
+            }
+            chapters.append(current_chapter)
+
+            title = heading_title(b["lines"])
+            node = {"title": title or "（無題）", "href": f"text/{current_chapter['file']}", "children": []}
+            if BU_HEADING_RE.match(title):
+                current_chapter["section_type"] = "part"
+                nav_tree.append(node)
+                current_bu = node
+            elif title in FRONT_BACK_TITLES:
+                nav_tree.append(node)
+            elif current_bu is not None:
+                current_bu["children"].append(node)
+            else:
+                nav_tree.append(node)
+            current_chapter_nav = node
+            continue
+
+        chapter = ensure_chapter()
+
+        if b["kind"] == "heading" and b["level"] in ("中", "小"):
+            heading_seq += 1
+            hid = f"h{heading_seq:04d}"
+            b = {**b, "id": hid}
+            if b["level"] == "中" and current_chapter_nav is not None:
+                title = heading_title(b["lines"])
+                current_chapter_nav["children"].append(
+                    {"title": title or "（無題）", "href": f"text/{chapter['file']}#{hid}", "children": []}
+                )
+            chapter["blocks"].append(b)
+            continue
+
+        chapter["blocks"].append(b)
+
+    return chapters, nav_tree
+
+
+# --------------------------------------------------------------------------
+# XHTML レンダリング
+# --------------------------------------------------------------------------
+
+HEADING_TAG = {"大": "h1", "中": "h2", "小": "h3"}
+
+
+def render_heading(lines: list[str], level: str, hid: str | None) -> str:
+    parts = [normalize_text(l) for l in lines]
+    parts = [p for p in parts if p]
+    if not parts:
+        return ""
+    # 章扉・部扉の副題のダーシュ補正は to_aozora.emit_heading と共通のロジック
+    parts = fix_subtitle_dash(parts)
+    tag = HEADING_TAG[level]
+    attr = f' id="{hid}"' if hid else ""
+    out = [f"<{tag}{attr}>{render_inline(parts[0])}</{tag}>"]
+    for extra in parts[1:]:
+        out.append(f'<p class="subtitle">{render_inline(extra)}</p>')
+    return "\n".join(out)
+
+
+def render_table(block: dict) -> str:
+    grid: dict[tuple[int, int], dict] = {(c["row"], c["col"]): c for c in block["cells"]}
+    covered: set[tuple[int, int]] = set()
+    rows_html = []
+    for r in range(1, block["n_row"] + 1):
+        tds = []
+        for c in range(1, block["n_col"] + 1):
+            if (r, c) in covered:
+                continue
+            cell = grid.get((r, c))
+            if cell is None:
+                tds.append("<td></td>")
+                continue
+            rs, cs = cell.get("row_span", 1) or 1, cell.get("col_span", 1) or 1
+            for dr in range(rs):
+                for dc in range(cs):
+                    if dr or dc:
+                        covered.add((r + dr, c + dc))
+            attrs = ""
+            if rs > 1:
+                attrs += f' rowspan="{rs}"'
+            if cs > 1:
+                attrs += f' colspan="{cs}"'
+            text = join_lines(cell["contents"].split("\n")) if cell.get("contents") else ""
+            tds.append(f"<td{attrs}>{render_inline(normalize_text(text))}</td>")
+        rows_html.append("<tr>" + "".join(tds) + "</tr>")
+    return '<table class="h-table">\n' + "\n".join(rows_html) + "\n</table>"
+
+
+def render_figure(block: dict) -> str:
+    alt = escape_attr(block.get("alt") or "")
+    return f'<figure class="h-figure"><img src="../images/{block["src"]}" alt="{alt}"/></figure>'
+
+
+def render_block(b: dict) -> str:
+    kind = b["kind"]
+    if kind == "para":
+        text = normalize_text(join_lines(b["lines"]))
+        return f"<p>{render_inline(text)}</p>" if text else ""
+    if kind == "raw":
+        return f"<p>{render_inline(b['text'])}</p>" if b["text"] else ""
+    if kind == "heading":
+        return render_heading(b["lines"], b["level"], b.get("id"))
+    if kind == "table":
+        return render_table(b)
+    if kind == "figure":
+        return render_figure(b)
+    raise ValueError(f"未知の IR kind: {kind}")
+
+
+def xhtml_page(title: str, body_inner: str, css_href: str, epub_type: str, lang: str = "ja") -> str:
+    return (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        "<!DOCTYPE html>\n"
+        '<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops" '
+        f'xml:lang="{lang}" lang="{lang}">\n'
+        "<head><meta charset=\"UTF-8\"/><title>" + escape(title) + "</title>\n"
+        f'<link rel="stylesheet" type="text/css" href="{css_href}"/></head>\n'
+        f'<body><section epub:type="{epub_type}">\n{body_inner}\n</section></body>\n'
+        "</html>\n"
+    )
+
+
+def render_chapter_xhtml(chapter: dict) -> str:
+    body = "\n".join(filter(None, (render_block(b) for b in chapter["blocks"])))
+    first = chapter["blocks"][0] if chapter["blocks"] else None
+    title = heading_title(first["lines"]) if first and first["kind"] == "heading" else "本文"
+    return xhtml_page(title or "本文", body, "../style.css", chapter["section_type"])
+
+
+# --------------------------------------------------------------------------
+# nav.xhtml
+# --------------------------------------------------------------------------
+
+
+def render_nav_list(nodes: list[dict]) -> str:
+    if not nodes:
+        return ""
+    items = []
+    for node in nodes:
+        inner = f'<a href="{escape_attr(node["href"])}">{escape(node["title"])}</a>'
+        children = render_nav_list(node["children"])
+        items.append(f"<li>{inner}{children}</li>")
+    return "<ol>" + "".join(items) + "</ol>"
+
+
+def render_nav_xhtml(nav_tree: list[dict], first_chapter_href: str | None) -> str:
+    """nav.xhtml を組み立てる（toc は section で包まず nav 要素を body 直下に置く）"""
+
+    toc_list = render_nav_list(nav_tree)
+    if not toc_list:
+        # EPUB3 の toc nav は最低 1 エントリを持つ <ol> が必要（空の <nav> は仕様違反）。
+        # 章がまったく検出できなかった場合のフォールバックとして本文への1項目だけ出す。
+        fallback_href = escape_attr(first_chapter_href) if first_chapter_href else "nav.xhtml"
+        toc_list = f'<ol><li><a href="{fallback_href}">本文</a></li></ol>'
+    toc = f'<nav epub:type="toc" id="toc"><h1>目次</h1>{toc_list}</nav>'
+    landmarks_items = ['<li><a epub:type="cover" href="cover.xhtml">表紙</a></li>',
+                        '<li><a epub:type="toc" href="nav.xhtml">目次</a></li>']
+    if first_chapter_href:
+        landmarks_items.append(
+            f'<li><a epub:type="bodymatter" href="{escape_attr(first_chapter_href)}">本文</a></li>'
+        )
+    landmarks = (
+        '<nav epub:type="landmarks" id="landmarks" hidden="">'
+        f'<ol>{"".join(landmarks_items)}</ol></nav>'
+    )
+    return (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        "<!DOCTYPE html>\n"
+        '<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops" '
+        'xml:lang="ja" lang="ja">\n'
+        "<head><meta charset=\"UTF-8\"/><title>目次</title>\n"
+        '<link rel="stylesheet" type="text/css" href="style.css"/></head>\n'
+        f"<body>\n{toc}\n{landmarks}\n</body>\n"
+        "</html>\n"
+    )
+
+
+# --------------------------------------------------------------------------
+# CSS
+# --------------------------------------------------------------------------
+
+
+def build_css(horizontal: bool) -> str:
+    mode = "horizontal-tb" if horizontal else "vertical-rl"
+    return f"""html, body {{
+  writing-mode: {mode};
+  -epub-writing-mode: {mode};
+  -webkit-writing-mode: {mode};
+  font-family: "Noto Serif CJK JP", serif;
+  line-height: 1.9;
+}}
+h1 {{ font-size: 1.6em; margin: 1.2em 0 0.6em; }}
+h2 {{ font-size: 1.3em; margin: 1em 0 0.5em; }}
+h3 {{ font-size: 1.1em; margin: 0.8em 0 0.4em; }}
+p {{ margin: 0; text-indent: 1em; }}
+p.subtitle {{ text-indent: 0; font-size: 0.9em; }}
+table.h-table, figure.h-figure {{
+  writing-mode: horizontal-tb;
+  -epub-writing-mode: horizontal-tb;
+  -webkit-writing-mode: horizontal-tb;
+}}
+table.h-table {{ border-collapse: collapse; margin: 1em 0; }}
+table.h-table th, table.h-table td {{ border: 1px solid #333; padding: 0.3em 0.6em; }}
+figure.h-figure {{ margin: 1em 0; text-align: center; }}
+figure.h-figure img {{ max-width: 100%; height: auto; }}
+"""
+# landmarks nav は epub:type="landmarks" 属性に加え hidden="" 属性で隠しているため、
+# CSS 側で明示的に非表示にする必要はない。@namespace 宣言なしの
+# nav[epub|type~="landmarks"] セレクタは無効（属性セレクタの名前空間接頭辞が
+# 未解決になる）なので、あえて追加しない。
+
+
+# --------------------------------------------------------------------------
+# package.opf
+# --------------------------------------------------------------------------
+
+
+def build_opf(
+    *,
+    title: str,
+    author: str,
+    publisher: str,
+    book_uuid: str,
+    modified: str,
+    manifest_items: list[dict],
+    spine_items: list[dict],
+    horizontal: bool,
+) -> str:
+    meta = [
+        f'<dc:identifier id="pub-id">urn:uuid:{book_uuid}</dc:identifier>',
+        f"<dc:title>{escape(title)}</dc:title>",
+        "<dc:language>ja</dc:language>",
+    ]
+    if author:
+        meta.append(f"<dc:creator>{escape(author)}</dc:creator>")
+    if publisher:
+        meta.append(f"<dc:publisher>{escape(publisher)}</dc:publisher>")
+    meta.append(f'<meta property="dcterms:modified">{modified}</meta>')
+
+    manifest = "\n".join(
+        f'<item id="{it["id"]}" href="{it["href"]}" media-type="{it["media_type"]}"'
+        + (f' properties="{it["properties"]}"' if it.get("properties") else "")
+        + "/>"
+        for it in manifest_items
+    )
+    spine_attr = "" if horizontal else ' page-progression-direction="rtl"'
+    spine = "\n".join(
+        f'<itemref idref="{it["idref"]}"'
+        + (f' linear="{it["linear"]}"' if it.get("linear") else "")
+        + "/>"
+        for it in spine_items
+    )
+    return f"""<?xml version="1.0" encoding="UTF-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="pub-id" xml:lang="ja">
+<metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+{chr(10).join(meta)}
+</metadata>
+<manifest>
+{manifest}
+</manifest>
+<spine{spine_attr}>
+{spine}
+</spine>
+</package>
+"""
+
+
+CONTAINER_XML = """<?xml version="1.0" encoding="UTF-8"?>
+<container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">
+   <rootfiles>
+      <rootfile full-path="OEBPS/package.opf" media-type="application/oebps-package+xml"/>
+   </rootfiles>
+</container>
+"""
+
+
+# --------------------------------------------------------------------------
+# カバー
+# --------------------------------------------------------------------------
+
+
+def render_cover_png(pdf_path: Path, page_no: int, dpi: int) -> bytes:
+    import pypdfium2
+
+    doc = pypdfium2.PdfDocument(str(pdf_path))
+    try:
+        pil = doc[page_no - 1].render(scale=dpi / 72).to_pil().convert("RGB")
+    finally:
+        doc.close()
+    buf = io.BytesIO()
+    pil.save(buf, format="PNG")
+    return buf.getvalue()
+
+
+# --------------------------------------------------------------------------
+# 自己検証
+# --------------------------------------------------------------------------
+
+
+def self_check(epub_path: Path) -> list[str]:
+    """生成した EPUB を zip 構造・XML 整形式・manifest/spine 突合の観点で検証する"""
+
+    problems: list[str] = []
+    with zipfile.ZipFile(epub_path) as zf:
+        infos = zf.infolist()
+        if not infos or infos[0].filename != "mimetype":
+            problems.append("mimetype が zip の先頭エントリではありません")
+        else:
+            if infos[0].compress_type != zipfile.ZIP_STORED:
+                problems.append("mimetype が無圧縮（ZIP_STORED）で格納されていません")
+            if zf.read("mimetype") != b"application/epub+zip":
+                problems.append("mimetype の内容が application/epub+zip ではありません")
+
+        names = set(zf.namelist())
+        opf_path = None
+        for name in names:
+            if name.endswith((".xhtml", ".opf", ".ncx")):
+                try:
+                    ET.fromstring(zf.read(name))
+                except ET.ParseError as e:
+                    problems.append(f"整形式エラー: {name}: {e}")
+            if name.endswith(".opf"):
+                opf_path = name
+
+        if opf_path is None:
+            problems.append("package.opf が見つかりません")
+            return problems
+
+        ns = {"opf": "http://www.idpf.org/2007/opf"}
+        root = ET.fromstring(zf.read(opf_path))
+        opf_dir = str(Path(opf_path).parent).replace("\\", "/")
+
+        manifest_items = {
+            item.get("id"): item.get("href") for item in root.find("opf:manifest", ns)
+        }
+        declared = {opf_path}
+        for id_, href in manifest_items.items():
+            full = f"{opf_dir}/{href}" if opf_dir not in ("", ".") else href
+            declared.add(full)
+            if full not in names:
+                problems.append(f"manifest 項目 {id_} のファイルが zip にありません: {full}")
+
+        spine = root.find("opf:spine", ns)
+        for itemref in spine:
+            idref = itemref.get("idref")
+            if idref not in manifest_items:
+                problems.append(f"spine の idref が manifest にありません: {idref}")
+
+        for name in names:
+            if name == "mimetype" or name.startswith("META-INF/"):
+                continue
+            if name not in declared:
+                problems.append(f"zip にあるが manifest 未登録: {name}")
+
+    return problems
+
+
+# --------------------------------------------------------------------------
+# 変換本体
+# --------------------------------------------------------------------------
+
+
+def build_epub(
+    *,
+    json_dir: str,
+    pdf_path: str,
+    out_path: str,
+    title: str,
+    author: str = "",
+    publisher: str = "",
+    horizontal: bool = False,
+    layout_pages: str = "",
+    skip_pages: str = "",
+    dpi: int = 200,
+    cover_page: int = 1,
+    proofread_fixes: str | None = None,
+    keep_printed_toc: bool = False,
+):
+    pdf_path, out_path = Path(pdf_path), Path(out_path)
+
+    blocks, _ir_stats = build_ir(json_dir, pdf_path, layout_pages=layout_pages, skip_pages=skip_pages)
+    blocks = filter_printed_toc(blocks, keep=keep_printed_toc)
+
+    if proofread_fixes:
+        import json as jsonlib
+
+        fixes_path = Path(proofread_fixes)
+        try:
+            fixes = jsonlib.loads(fixes_path.read_text(encoding="utf-8"))
+        except (jsonlib.JSONDecodeError, OSError) as e:
+            raise SystemExit(f"校正 fixes の読み込みに失敗しました: {fixes_path}: {e}") from e
+        blocks = apply_fixes(blocks, fixes)
+
+    chapters, nav_tree = split_chapters_and_nav(blocks)
+    n_tables = sum(1 for b in blocks if b["kind"] == "table")
+    n_figures = sum(1 for b in blocks if b["kind"] == "figure")
+
+    manifest_items: list[dict] = []
+    spine_items: list[dict] = []
+    files: dict[str, bytes] = {}
+
+    css = build_css(horizontal)
+    files["OEBPS/style.css"] = css.encode("utf-8")
+    manifest_items.append({"id": "css", "href": "style.css", "media_type": "text/css"})
+
+    # --- カバー ---
+    cover_png = render_cover_png(pdf_path, cover_page, dpi)
+    files["OEBPS/images/cover.png"] = cover_png
+    manifest_items.append(
+        {"id": "cover-img", "href": "images/cover.png", "media_type": "image/png", "properties": "cover-image"}
+    )
+    cover_html = xhtml_page(
+        title, '<figure class="h-figure"><img src="images/cover.png" alt="表紙"/></figure>', "style.css", "cover"
+    )
+    files["OEBPS/cover.xhtml"] = cover_html.encode("utf-8")
+    manifest_items.append({"id": "cover-page", "href": "cover.xhtml", "media_type": "application/xhtml+xml"})
+    spine_items.append({"idref": "cover-page"})
+
+    # --- nav ---
+    first_href = f"text/{chapters[0]['file']}" if chapters else None
+    nav_html = render_nav_xhtml(nav_tree, first_href)
+    files["OEBPS/nav.xhtml"] = nav_html.encode("utf-8")
+    manifest_items.append({"id": "nav", "href": "nav.xhtml", "media_type": "application/xhtml+xml", "properties": "nav"})
+    spine_items.append({"idref": "nav", "linear": "no"})
+
+    # --- 図版切り出し ---
+    fig_jobs = [
+        {"page": b["page"], "box": b["box"], "name": b["src"]} for b in blocks if b["kind"] == "figure"
+    ]
+    if fig_jobs:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_dir = Path(tmp)
+            crop_figures(pdf_path, fig_jobs, tmp_dir, dpi)
+            for job in fig_jobs:
+                data = (tmp_dir / job["name"]).read_bytes()
+                files[f"OEBPS/images/{job['name']}"] = data
+                img_id = f"img-{Path(job['name']).stem}"
+                manifest_items.append({"id": img_id, "href": f"images/{job['name']}", "media_type": "image/png"})
+
+    # --- 章 ---
+    for idx, chapter in enumerate(chapters):
+        xhtml = render_chapter_xhtml(chapter)
+        files[f"OEBPS/text/{chapter['file']}"] = xhtml.encode("utf-8")
+        item_id = f"ch{idx:03d}"
+        manifest_items.append({"id": item_id, "href": f"text/{chapter['file']}", "media_type": "application/xhtml+xml"})
+        spine_items.append({"idref": item_id})
+
+    # --- package.opf ---
+    modified = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    opf = build_opf(
+        title=title,
+        author=author,
+        publisher=publisher,
+        book_uuid=str(uuid.uuid4()),
+        modified=modified,
+        manifest_items=manifest_items,
+        spine_items=spine_items,
+        horizontal=horizontal,
+    )
+    files["OEBPS/package.opf"] = opf.encode("utf-8")
+
+    # --- zip 書き出し ---
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(out_path, "w") as zf:
+        mimetype_info = zipfile.ZipInfo("mimetype")
+        mimetype_info.compress_type = zipfile.ZIP_STORED
+        zf.writestr(mimetype_info, b"application/epub+zip")
+        zf.writestr("META-INF/container.xml", CONTAINER_XML, compress_type=zipfile.ZIP_DEFLATED)
+        for name, data in files.items():
+            zf.writestr(name, data, compress_type=zipfile.ZIP_DEFLATED)
+
+    size = out_path.stat().st_size
+    print(f"出力: {out_path} ({size:,} bytes)")
+    print(f"  章ファイル数: {len(chapters)} / 表: {n_tables} / 図版: {n_figures}")
+    print(f"  nav 第1階層: {len(nav_tree)} 項目")
+
+    problems = self_check(out_path)
+    if problems:
+        print("self-check: FAIL")
+        for p in problems:
+            print(f"  - {p}")
+    else:
+        print("self-check: PASS")
+
+    return out_path, problems
+
+
+def main():
+    parser = argparse.ArgumentParser(description="OCR JSON から EPUB3 を生成する")
+    parser.add_argument("-j", "--json-dir", default="ocr_json", help="OCR JSON ディレクトリ")
+    parser.add_argument("-p", "--pdf", required=True, help="元 PDF（カバー・図版切り出し用）")
+    parser.add_argument("-o", "--output", required=True, help="出力 EPUB ファイル")
+    parser.add_argument("--title", required=True, help="書名")
+    parser.add_argument("--author", default="", help="著者")
+    parser.add_argument("--publisher", default="", help="出版社")
+    parser.add_argument("--horizontal", action="store_true", help="横書きで出力する（既定は縦書き）")
+    parser.add_argument("--layout-pages", default="", help="段組を幾何的に復元するページ（例: 2-3,287-295）")
+    parser.add_argument("--skip-pages", default="", help="出力しないページ（例: 1,301）")
+    parser.add_argument("--dpi", type=int, default=200, help="OCR 時と同じ DPI（図版切り出し・カバー用）")
+    parser.add_argument("--cover-page", type=int, default=1, help="カバーに使う PDF ページ（1始まり）")
+    parser.add_argument("--proofread-fixes", default=None, help="適用する校正 fixes JSON")
+    parser.add_argument(
+        "--keep-printed-toc", action="store_true", help="印刷目次ページを本文から除外しない"
+    )
+    args = parser.parse_args()
+
+    _out, problems = build_epub(
+        json_dir=args.json_dir,
+        pdf_path=args.pdf,
+        out_path=args.output,
+        title=args.title,
+        author=args.author,
+        publisher=args.publisher,
+        horizontal=args.horizontal,
+        layout_pages=args.layout_pages,
+        skip_pages=args.skip_pages,
+        dpi=args.dpi,
+        cover_page=args.cover_page,
+        proofread_fixes=args.proofread_fixes,
+        keep_printed_toc=args.keep_printed_toc,
+    )
+    if problems:
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

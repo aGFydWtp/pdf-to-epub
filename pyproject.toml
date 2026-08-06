@@ -1,0 +1,9 @@
+[project]
+name = "pdf-to-epub"
+version = "0.1.0"
+description = "書籍 PDF を yomitoku で OCR し、LLM 校正を経て日本語縦書き EPUB3 に変換するパイプライン"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "yomitoku>=0.11.0",
+]

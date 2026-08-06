@@ -1,0 +1,12 @@
+.venv/
+__pycache__/
+*.pyc
+uv.lock
+
+# 実行時に生成される作業データ（書籍ごとの作業ディレクトリに置く想定）
+ocr_json/
+proofread_cache/
+aozora_fig/
+*.epub
+*.pdf
+claudedocs/
