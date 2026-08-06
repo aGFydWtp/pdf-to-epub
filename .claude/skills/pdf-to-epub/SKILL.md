@@ -8,16 +8,30 @@ description: 書籍をスキャンした PDF を OCR して日本語縦書き EP
 書籍 PDF を yomitoku で OCR し、章ごとに OCR と LLM 校正をパイプライン並列実行してから、
 日本語縦書き・階層目次付きの EPUB3 を生成するワークフロー。
 
+## 準備（パイプラインの取得）
+
+パイプライン本体は https://github.com/aGFydWtp/pdf-to-epub にある。
+ローカルにコードがなくても、キャッシュディレクトリへ取得して実行する。
+まず以下を実行して `$PIPE` を用意すること:
+
+```bash
+PIPE="${XDG_CACHE_HOME:-$HOME/.cache}/pdf-to-epub"
+if [ -d "$PIPE/.git" ]; then
+  git -C "$PIPE" pull --ff-only
+else
+  git clone --depth 1 https://github.com/aGFydWtp/pdf-to-epub "$PIPE"
+fi
+```
+
+- 以降のコマンドはすべて `uv run --project "$PIPE" python "$PIPE/<script>.py" ...` の形で
+  実行する（素の `python` は使わない）
+- 初回実行時は uv が `$PIPE/.venv` を作り yomitoku・torch 等（数 GB）を導入するため
+  時間がかかる。2 回目以降はキャッシュされる
+- 開発中のローカルチェックアウト（例: `~/Documents/pdf-to-epub`）で作業している場合は、
+  clone せず `PIPE=そのディレクトリ` としてよい
+
 ## 前提
 
-- パイプライン本体は `~/Documents/pdf-to-epub/` にある（uv 管理）。以下 `$PIPE` と表記:
-
-  ```bash
-  PIPE=~/Documents/pdf-to-epub
-  ```
-
-- 実行は必ず `uv run --project "$PIPE" python "$PIPE/<script>.py" ...` の形にする
-  （素の `python` は使わない。初回実行時は uv が .venv を作り yomitoku 等を導入する）
 - **作業ディレクトリは書籍ごとに用意し、PDF を置いた場所で実行する**。
   `ocr_json/`・`proofread_cache/`・EPUB などの生成物はカレントディレクトリにできる
 - OCR は 1 ページ数秒〜十数秒（CPU/MPS/CUDA）。ページ単位で JSON にキャッシュされ、

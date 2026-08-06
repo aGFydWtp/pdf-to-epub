@@ -34,6 +34,4 @@ epubcheck "書名.epub"
 ```
 
 詳細な手順・引数の決め方・中断再開の方法は
-[.claude/skills/pdf-to-epub/SKILL.md](.claude/skills/pdf-to-epub/SKILL.md) を参照
-（同内容を `~/.claude/skills/pdf-to-epub/` にも配置しており、Claude Code からは
-どのディレクトリでも `/pdf-to-epub` スキルとして呼び出せる）。
+[.claude/skills/pdf-to-epub/SKILL.md](.claude/skills/pdf-to-epub/SKILL.md) を参照。
