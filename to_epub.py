@@ -419,7 +419,35 @@ def render_nav_xhtml(nav_tree: list[dict], first_chapter_href: str | None) -> st
 
 
 def build_css(horizontal: bool) -> str:
+    """縦書き（vertical-rl）／横書き（horizontal-tb）それぞれの style.css を組み立てる。
+
+    見出しの前後空きを margin-top/bottom で書くと、縦書きでは行内方向の余白に
+    なってしまい見出しの前後が詰まる。流れ方向に沿う論理プロパティ
+    （margin-block-start / margin-block-end）で指定し、横書き時だけは論理
+    プロパティ非対応の古いビューア向けに同値の物理指定をフォールバックとして
+    併記する（縦書き時は物理指定を出さない＝壊れる指定を残さない）。
+    """
+
     mode = "horizontal-tb" if horizontal else "vertical-rl"
+
+    def block_margin(start: str, end: str) -> str:
+        """見出しの流れ方向の前後空き。横書き時のみ物理プロパティを先に置く。"""
+
+        fallback = f"margin: {start} 0 {end}; " if horizontal else ""
+        return f"{fallback}margin-block-start: {start}; margin-block-end: {end};"
+
+    # 表・図版は縦書き本文の中でも横組みで読ませる。横書き時は本文と同じ組方向
+    # なので上書き自体が不要（class 名は XHTML 側で常に付くが CSS 側で分岐する）。
+    h_override = "" if horizontal else """table.h-table, figure.h-figure {
+  writing-mode: horizontal-tb;
+  -epub-writing-mode: horizontal-tb;
+  -webkit-writing-mode: horizontal-tb;
+}
+"""
+    # 表・図版は自身が horizontal-tb なので論理プロパティは本文の流れ方向と一致
+    # しない。前後空きは本文の組方向に合わせた物理プロパティで直接指定する。
+    block_gap = "1em 0" if horizontal else "0 1em"
+
     return f"""html, body {{
   writing-mode: {mode};
   -epub-writing-mode: {mode};
@@ -427,19 +455,14 @@ def build_css(horizontal: bool) -> str:
   font-family: "Noto Serif CJK JP", serif;
   line-height: 1.9;
 }}
-h1 {{ font-size: 1.6em; margin: 1.2em 0 0.6em; }}
-h2 {{ font-size: 1.3em; margin: 1em 0 0.5em; }}
-h3 {{ font-size: 1.1em; margin: 0.8em 0 0.4em; }}
+h1 {{ font-size: 1.6em; {block_margin("1.2em", "0.6em")} }}
+h2 {{ font-size: 1.3em; {block_margin("1em", "0.5em")} }}
+h3 {{ font-size: 1.1em; {block_margin("0.8em", "0.4em")} }}
 p {{ margin: 0; text-indent: 1em; }}
 p.subtitle {{ text-indent: 0; font-size: 0.9em; }}
-table.h-table, figure.h-figure {{
-  writing-mode: horizontal-tb;
-  -epub-writing-mode: horizontal-tb;
-  -webkit-writing-mode: horizontal-tb;
-}}
-table.h-table {{ border-collapse: collapse; margin: 1em 0; }}
+{h_override}table.h-table {{ border-collapse: collapse; margin: {block_gap}; }}
 table.h-table th, table.h-table td {{ border: 1px solid #333; padding: 0.3em 0.6em; }}
-figure.h-figure {{ margin: 1em 0; text-align: center; }}
+figure.h-figure {{ margin: {block_gap}; text-align: center; }}
 figure.h-figure img {{ max-width: 100%; height: auto; }}
 """
 # landmarks nav は epub:type="landmarks" 属性に加え hidden="" 属性で隠しているため、
@@ -474,6 +497,11 @@ def build_opf(
     if publisher:
         meta.append(f"<dc:publisher>{escape(publisher)}</dc:publisher>")
     meta.append(f'<meta property="dcterms:modified">{modified}</meta>')
+    # Kindle や日本語ビューアが本の既定の組方向を判断するための拡張メタ。
+    # spine の page-progression-direction だけではページ送り方向しか伝わらない。
+    meta.append(
+        f'<meta property="primary-writing-mode">{"horizontal-tb" if horizontal else "vertical-rl"}</meta>'
+    )
 
     manifest = "\n".join(
         f'<item id="{it["id"]}" href="{it["href"]}" media-type="{it["media_type"]}"'
@@ -535,8 +563,12 @@ def render_cover_png(pdf_path: Path, page_no: int, dpi: int) -> bytes:
 # --------------------------------------------------------------------------
 
 
-def self_check(epub_path: Path) -> list[str]:
-    """生成した EPUB を zip 構造・XML 整形式・manifest/spine 突合の観点で検証する"""
+def self_check(epub_path: Path, horizontal: bool = False) -> list[str]:
+    """生成した EPUB を zip 構造・XML 整形式・manifest/spine 突合・縦横整合の観点で検証する
+
+    縦横整合は style.css の writing-mode、spine の page-progression-direction、
+    primary-writing-mode メタの3点が `horizontal` と食い違っていないかを見る。
+    """
 
     problems: list[str] = []
     with zipfile.ZipFile(epub_path) as zf:
@@ -583,6 +615,45 @@ def self_check(epub_path: Path) -> list[str]:
             idref = itemref.get("idref")
             if idref not in manifest_items:
                 problems.append(f"spine の idref が manifest にありません: {idref}")
+
+        # --- 縦横整合 ---
+        expected_mode = "horizontal-tb" if horizontal else "vertical-rl"
+
+        css_path = f"{opf_dir}/style.css" if opf_dir not in ("", ".") else "style.css"
+        if css_path not in names:
+            problems.append(f"style.css が見つかりません: {css_path}")
+        else:
+            css = zf.read(css_path).decode("utf-8")
+            body_rule = re.search(r"html,\s*body\s*\{([^}]*)\}", css)
+            if body_rule is None:
+                problems.append("style.css に html, body の規則がありません")
+            else:
+                # ベンダー接頭辞付き（-epub- / -webkit-）も含め、すべて同じ値であること
+                modes = [v.strip() for v in re.findall(r"writing-mode:\s*([^;]+);", body_rule.group(1))]
+                if not modes:
+                    problems.append("style.css の html, body に writing-mode がありません")
+                elif any(v != expected_mode for v in modes):
+                    problems.append(
+                        f"style.css の writing-mode が期待値と異なります: {modes}（期待: {expected_mode}）"
+                    )
+
+        expected_ppd = None if horizontal else "rtl"
+        ppd = spine.get("page-progression-direction")
+        if ppd != expected_ppd:
+            problems.append(
+                f"spine の page-progression-direction が期待値と異なります: "
+                f"{ppd!r}（期待: {expected_ppd!r}）"
+            )
+
+        pwm = [
+            (m.text or "").strip()
+            for m in root.iterfind("opf:metadata/opf:meta", ns)
+            if m.get("property") == "primary-writing-mode"
+        ]
+        if pwm != [expected_mode]:
+            problems.append(
+                f"primary-writing-mode メタが期待値と異なります: {pwm}（期待: [{expected_mode!r}]）"
+            )
 
         for name in names:
             if name == "mimetype" or name.startswith("META-INF/"):
@@ -712,7 +783,7 @@ def build_epub(
     print(f"  章ファイル数: {len(chapters)} / 表: {n_tables} / 図版: {n_figures}")
     print(f"  nav 第1階層: {len(nav_tree)} 項目")
 
-    problems = self_check(out_path)
+    problems = self_check(out_path, horizontal=horizontal)
     if problems:
         print("self-check: FAIL")
         for p in problems:
