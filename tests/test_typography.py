@@ -4,11 +4,23 @@ to_epub は import 時に yomitoku/torch を必要としない（pypdfium2 は�
 import）ため、OCR 環境なしで純粋関数レベルのテストが回る。
 """
 
+import re
 import xml.etree.ElementTree as ET
 
 import pytest
 
-from to_epub import add_tcy, build_css, heading_title, render_figure, render_inline, render_nav_list
+from book_ir import normalize_text
+from to_epub import (
+    add_tcy,
+    build_css,
+    heading_title,
+    render_chapter_xhtml,
+    render_figure,
+    render_inline,
+    render_nav_list,
+    render_plain,
+    strip_ruby,
+)
 
 TCY_OPEN = '<span class="tcy">'
 
@@ -194,3 +206,66 @@ def test_nav_children_are_rendered_recursively():
     assert "《" not in html
     assert html.count("<ol>") == 2
     ET.fromstring(html)
+
+
+# --- normalize_text 経由の統合（実パイプラインの経路） ------------------
+
+
+def test_tcy_fires_on_normalized_exclamations():
+    """book_ir の PUNCT_MAP が ! ? を全角化するので、全角も対象でないと発動しない
+
+    半角入力だけを検査するテストは、実パイプラインで一度も通らない経路を
+    見ているだけで回帰を検出できない。
+    """
+
+    normalized = normalize_text("えっ!?　まさか!!")
+    assert normalized == "えっ！？まさか！！"     # 前提: 全角化されている
+    html = render_inline(normalized)
+    # 全角のまま span に入れると1文字幅で潰れるため半角に戻す
+    assert '<span class="tcy">!?</span>' in html
+    assert '<span class="tcy">!!</span>' in html
+    assert "！？" not in html
+
+
+def test_tcy_fires_on_normalized_digits():
+    """全角数字は NFKC で半角化されるので、そのまま2桁の縦中横対象になる"""
+
+    html = render_inline(normalize_text("第１２章と１９８０年と３人"))
+    assert '<span class="tcy">12</span>' in html
+    assert "1980" in html and '<span class="tcy">1980' not in html   # 4桁は対象外
+    assert '<span class="tcy">3' not in html                          # 1桁は対象外
+
+
+def test_single_exclamation_is_not_combined():
+    assert "tcy" not in render_inline(normalize_text("すごい!"))
+
+
+# --- <title> / alt のルビ記法 ------------------------------------------
+
+
+def test_chapter_title_has_no_ruby_notation():
+    """<title> はマークアップを置けないので親文字だけ残す"""
+
+    chapter = {
+        "blocks": [{"kind": "heading", "level": "大", "lines": ["第１２章　｜天体《てんたい》の運行"], "page": 1}],
+        "section_type": "chapter",
+    }
+    html = render_chapter_xhtml(chapter)
+    title = re.search(r"<title>(.*?)</title>", html).group(1)
+    assert "｜" not in title and "《" not in title and "》" not in title
+    assert "天体" in title and "てんたい" not in title
+
+
+def test_figure_alt_has_no_ruby_notation():
+    html = render_figure({"src": "p0015_fig01.png", "alt": "図１２　｜天体《てんたい》の図"})
+    alt = re.search(r'alt="(.*?)"', html).group(1)
+    assert "｜" not in alt and "《" not in alt
+    assert "天体" in alt and "てんたい" not in alt
+    assert "fig01.png" in html          # 画像パスは無傷
+
+
+def test_strip_ruby_does_not_escape():
+    """strip_ruby はエスケープしない（埋め込み側が escape するため二重適用を避ける）"""
+
+    assert strip_ruby("A & B｜漢字《かんじ》") == "A & B漢字"
+    assert render_plain("A & B｜漢字《かんじ》") == "A &amp; B漢字"

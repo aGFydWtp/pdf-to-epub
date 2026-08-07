@@ -36,8 +36,14 @@ RUBY_BARE_RE = re.compile(f"([{_KANJI_CLASS}]+)《([^《》]+)》")
 # （'第１２章' → '第12章'）、縦書きではそのままだと数字が横倒しになる。
 #   - 半角数字ちょうど2桁だけを対象にする。1桁は回転しないので不要、3桁以上は
 #     1文字幅に潰れて判読不能になるため絶対に含めない（4桁の年号 1980 も対象外）
-#   - 「!!」「!?」「?!」「??」の2字連続は慣習的に縦中横にする
-TCY_RE = re.compile(r"(?<![0-9A-Za-z])([0-9]{2})(?![0-9A-Za-z])|(?<![!?])([!?]{2})(?![!?])")
+#   - 「!!」「!?」「?!」「??」の2字連続は慣習的に縦中横にする。ただし book_ir の
+#     PUNCT_MAP が ! ? を全角化するため、実際に render_inline() へ届くのは「！？」
+#     の形。全角も対象に含めないとこの分岐は一度も発動しない。span の中身は
+#     半角に戻す（全角2字を1文字幅に組むと潰れて読めない）
+TCY_RE = re.compile(
+    r"(?<![0-9A-Za-z])([0-9]{2})(?![0-9A-Za-z])|(?<![!?！？])([!?！？]{2})(?![!?！？])"
+)
+_TO_HALF_BANG = str.maketrans("！？", "!?")
 # 縦中横を適用してはいけない範囲（タグそのものと、ルビ要素の中身）を退避するための分割。
 # 属性値にマッチすると <img src="../images/fig02.png"/> のようなパスが壊れる。
 SKIP_RE = re.compile(r"(<ruby>.*?</ruby>|<[^>]+>)", re.S)
@@ -50,9 +56,12 @@ def add_tcy(html: str) -> str:
     偶数 index がテキストノードになる。ルビは <rt> の中も含めて丸ごと退避される。
     """
 
+    def wrap(m: re.Match) -> str:
+        return f'<span class="tcy">{m.group(0).translate(_TO_HALF_BANG)}</span>'
+
     parts = SKIP_RE.split(html)
     for i in range(0, len(parts), 2):
-        parts[i] = TCY_RE.sub(lambda m: f'<span class="tcy">{m.group(0)}</span>', parts[i])
+        parts[i] = TCY_RE.sub(wrap, parts[i])
     return "".join(parts)
 
 
@@ -94,10 +103,25 @@ def render_plain(text: str) -> str:
     本文の文字として現れることはない）。
     """
 
-    escaped = escape(text)
-    escaped = RUBY_PIPE_RE.sub(lambda m: m.group(1), escaped)
-    escaped = RUBY_BARE_RE.sub(lambda m: m.group(1), escaped)
-    return escaped.replace("｜", "")
+    return escape(strip_ruby(text))
+
+
+def strip_ruby(text: str) -> str:
+    """｜親《ルビ》記法から親文字だけを残す（エスケープしない）。
+
+    render_plain() と違いエスケープを行わないので、<title> や alt 属性のように
+    埋め込み側が自前でエスケープする箇所に使う（render_plain() を渡すと二重
+    エスケープになる）。
+
+    RUBY_PIPE_RE は '｜親《ルビ》' 全体にマッチするので親文字への置換で ｜ ごと
+    消える。ルビの開始記号として使われなかった裸の ｜ は正規表現に拾われずに
+    残るため、最後にまとめて除去する（青空文庫記法では ｜ はルビ開始記号専用で、
+    本文の文字として現れることはない）。
+    """
+
+    out = RUBY_PIPE_RE.sub(lambda m: m.group(1), text)
+    out = RUBY_BARE_RE.sub(lambda m: m.group(1), out)
+    return out.replace("｜", "")
 
 
 def escape_attr(text: str) -> str:
@@ -380,7 +404,8 @@ def render_table(block: dict) -> str:
 
 
 def render_figure(block: dict) -> str:
-    alt = escape_attr(block.get("alt") or "")
+    # alt 属性もマークアップを置けないので、<title> と同様にルビ記法を落とす
+    alt = escape_attr(strip_ruby(block.get("alt") or ""))
     return f'<figure class="h-figure"><img src="../images/{block["src"]}" alt="{alt}"/></figure>'
 
 
@@ -417,7 +442,9 @@ def render_chapter_xhtml(chapter: dict) -> str:
     body = "\n".join(filter(None, (render_block(b) for b in chapter["blocks"])))
     first = chapter["blocks"][0] if chapter["blocks"] else None
     title = heading_title(first["lines"]) if first and first["kind"] == "heading" else "本文"
-    return xhtml_page(title or "本文", body, "../style.css", chapter["section_type"])
+    # <title> はマークアップを置けないので、ルビ記法は親文字だけ残して落とす
+    # （xhtml_page 側がエスケープするので strip_ruby の方を使う）
+    return xhtml_page(strip_ruby(title) or "本文", body, "../style.css", chapter["section_type"])
 
 
 # --------------------------------------------------------------------------
