@@ -7,3 +7,13 @@ requires-python = ">=3.12"
 dependencies = [
     "yomitoku>=0.11.0",
 ]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# リポジトリ直下のモジュール（to_epub.py など）をパッケージ化せずに import する
+pythonpath = ["."]

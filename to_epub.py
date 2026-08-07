@@ -3,7 +3,8 @@
 主な処理:
   - book_ir.build_ir() で IR ブロック列を構築し、印刷目次ページを既定で除外
   - 大見出しごとに XHTML を分割し、「部」「大見出し」「中見出し」の3階層 nav.xhtml を構築
-  - ｜親《ルビ》記法を <ruby><rt> へ変換
+  - 同じ目次ツリーから EPUB2 互換リーダー向けの toc.ncx を併載する
+  - ｜親《ルビ》記法を <ruby><rp><rt> へ変換し、半角2桁の数字などを縦中横（.tcy）で立てる
   - 表セル構造を <table>（rowspan/colspan 付き）へ、図版を crop_figures で切り出して <img> へ
   - PDF 1ページ目をカバー画像としてレンダリング
   - 生成した EPUB を zip 構造・XML 整形式・manifest/spine 突合の観点で自己検証する
@@ -31,18 +32,96 @@ _KANJI_CLASS = KANJI_RE.pattern.strip("[]")
 RUBY_PIPE_RE = re.compile(r"｜([^｜《》]+)《([^《》]+)》")
 RUBY_BARE_RE = re.compile(f"([{_KANJI_CLASS}]+)《([^《》]+)》")
 
+# 縦中横の対象。normalize_text() の NFKC 正規化で全角数字はすべて半角になるため
+# （'第１２章' → '第12章'）、縦書きではそのままだと数字が横倒しになる。
+#   - 半角数字ちょうど2桁だけを対象にする。1桁は回転しないので不要、3桁以上は
+#     1文字幅に潰れて判読不能になるため絶対に含めない（4桁の年号 1980 も対象外）
+#   - 「!!」「!?」「?!」「??」の2字連続は慣習的に縦中横にする。ただし book_ir の
+#     PUNCT_MAP が ! ? を全角化するため、実際に render_inline() へ届くのは「！？」
+#     の形。全角も対象に含めないとこの分岐は一度も発動しない。span の中身は
+#     半角に戻す（全角2字を1文字幅に組むと潰れて読めない）
+TCY_RE = re.compile(
+    r"(?<![0-9A-Za-z])([0-9]{2})(?![0-9A-Za-z])|(?<![!?！？])([!?！？]{2})(?![!?！？])"
+)
+_TO_HALF_BANG = str.maketrans("！？", "!?")
+# 縦中横を適用してはいけない範囲（タグそのものと、ルビ要素の中身）を退避するための分割。
+# 属性値にマッチすると <img src="../images/fig02.png"/> のようなパスが壊れる。
+SKIP_RE = re.compile(r"(<ruby>.*?</ruby>|<[^>]+>)", re.S)
+
+
+def add_tcy(html: str) -> str:
+    """レンダリング済み HTML 断片のテキストノードだけに <span class="tcy"> を付ける。
+
+    SKIP_RE で分割すると奇数 index が退避対象（タグ・ルビ要素まるごと）、
+    偶数 index がテキストノードになる。ルビは <rt> の中も含めて丸ごと退避される。
+    """
+
+    def wrap(m: re.Match) -> str:
+        return f'<span class="tcy">{m.group(0).translate(_TO_HALF_BANG)}</span>'
+
+    parts = SKIP_RE.split(html)
+    for i in range(0, len(parts), 2):
+        parts[i] = TCY_RE.sub(wrap, parts[i])
+    return "".join(parts)
+
 
 def render_inline(text: str) -> str:
     """本文中の｜親《ルビ》記法を <ruby><rt> タグへ変換する（エスケープ込み）。
 
     エスケープはここで一度だけ行う。｜《》は XML エスケープの対象外の文字なので、
     エスケープ後にルビ変換を行っても二重エスケープや取りこぼしは起きない。
+
+    <rp> はルビ非対応のリーダー向けのフォールバック。挿入するのは（）であって
+    《》ではないので、後続の RUBY_BARE_RE に再マッチして二重変換されることはない。
+    なお rp { display: none } は書かない（UA スタイルシートで既に非表示であり、
+    自前で書くと「CSS は解釈するがルビ非対応」なリーダーで括弧まで消えてしまう）。
+
+    縦中横は最後に適用する。ルビ変換より前にかけると [漢字]+《》 の隣接が span で
+    分断されて RUBY_BARE_RE が壊れる。
     """
 
+    def ruby(m: re.Match) -> str:
+        return f"<ruby>{m.group(1)}<rp>（</rp><rt>{m.group(2)}</rt><rp>）</rp></ruby>"
+
     escaped = escape(text)
-    escaped = RUBY_PIPE_RE.sub(lambda m: f"<ruby>{m.group(1)}<rt>{m.group(2)}</rt></ruby>", escaped)
-    escaped = RUBY_BARE_RE.sub(lambda m: f"<ruby>{m.group(1)}<rt>{m.group(2)}</rt></ruby>", escaped)
-    return escaped
+    escaped = RUBY_PIPE_RE.sub(ruby, escaped)
+    escaped = RUBY_BARE_RE.sub(ruby, escaped)
+    return add_tcy(escaped)
+
+
+def render_plain(text: str) -> str:
+    """｜親《ルビ》記法をプレーンテキスト化する（エスケープ込み・タグを一切出さない）。
+
+    NCX の navLabel/text はマークアップを一切許さない語彙で、<ruby> を入れると
+    epubcheck が RSC-005 で弾く（実測）。nav.xhtml 用の render_inline() と違い、
+    ルビ部《…》を捨てて親文字だけを残す。
+      '第12章｜天体《てんたい》の運行' → '第12章天体の運行'
+
+    RUBY_PIPE_RE は '｜親《ルビ》' 全体にマッチするので親文字への置換で ｜ ごと
+    消える。ルビの開始記号として使われなかった裸の ｜ は正規表現に拾われずに
+    残るため、最後にまとめて除去する（青空文庫記法では ｜ はルビ開始記号専用で、
+    本文の文字として現れることはない）。
+    """
+
+    return escape(strip_ruby(text))
+
+
+def strip_ruby(text: str) -> str:
+    """｜親《ルビ》記法から親文字だけを残す（エスケープしない）。
+
+    render_plain() と違いエスケープを行わないので、<title> や alt 属性のように
+    埋め込み側が自前でエスケープする箇所に使う（render_plain() を渡すと二重
+    エスケープになる）。
+
+    RUBY_PIPE_RE は '｜親《ルビ》' 全体にマッチするので親文字への置換で ｜ ごと
+    消える。ルビの開始記号として使われなかった裸の ｜ は正規表現に拾われずに
+    残るため、最後にまとめて除去する（青空文庫記法では ｜ はルビ開始記号専用で、
+    本文の文字として現れることはない）。
+    """
+
+    out = RUBY_PIPE_RE.sub(lambda m: m.group(1), text)
+    out = RUBY_BARE_RE.sub(lambda m: m.group(1), out)
+    return out.replace("｜", "")
 
 
 def escape_attr(text: str) -> str:
@@ -325,7 +404,8 @@ def render_table(block: dict) -> str:
 
 
 def render_figure(block: dict) -> str:
-    alt = escape_attr(block.get("alt") or "")
+    # alt 属性もマークアップを置けないので、<title> と同様にルビ記法を落とす
+    alt = escape_attr(strip_ruby(block.get("alt") or ""))
     return f'<figure class="h-figure"><img src="../images/{block["src"]}" alt="{alt}"/></figure>'
 
 
@@ -362,7 +442,9 @@ def render_chapter_xhtml(chapter: dict) -> str:
     body = "\n".join(filter(None, (render_block(b) for b in chapter["blocks"])))
     first = chapter["blocks"][0] if chapter["blocks"] else None
     title = heading_title(first["lines"]) if first and first["kind"] == "heading" else "本文"
-    return xhtml_page(title or "本文", body, "../style.css", chapter["section_type"])
+    # <title> はマークアップを置けないので、ルビ記法は親文字だけ残して落とす
+    # （xhtml_page 側がエスケープするので strip_ruby の方を使う）
+    return xhtml_page(strip_ruby(title) or "本文", body, "../style.css", chapter["section_type"])
 
 
 # --------------------------------------------------------------------------
@@ -375,7 +457,11 @@ def render_nav_list(nodes: list[dict]) -> str:
         return ""
     items = []
     for node in nodes:
-        inner = f'<a href="{escape_attr(node["href"])}">{escape(node["title"])}</a>'
+        # heading_title() は normalize_text() を通すだけで、normalize_text() は
+        # ｜《》を退避するためルビ記法が生のまま残る。nav の <a> の中には <ruby> を
+        # 置けるので、本文と同じ render_inline() でルビ化する。
+        # render_inline() が自前でエスケープするため escape() の二重適用はしない。
+        inner = f'<a href="{escape_attr(node["href"])}">{render_inline(node["title"])}</a>'
         children = render_nav_list(node["children"])
         items.append(f"<li>{inner}{children}</li>")
     return "<ol>" + "".join(items) + "</ol>"
@@ -414,12 +500,172 @@ def render_nav_xhtml(nav_tree: list[dict], first_chapter_href: str | None) -> st
 
 
 # --------------------------------------------------------------------------
+# toc.ncx（EPUB2 互換）
+# --------------------------------------------------------------------------
+
+NCX_ID = "ncx"
+NCX_HREF = "toc.ncx"
+NCX_MEDIA_TYPE = "application/x-dtbncx+xml"
+
+
+def nav_depth(nodes: list[dict]) -> int:
+    """目次ツリーの最大階層数（dtb:depth 用）。空なら 0。"""
+
+    return max((1 + nav_depth(n["children"]) for n in nodes), default=0)
+
+
+def render_nav_points(
+    nodes: list[dict], counter: list[int], indent: str = "  ", seen: dict[str, int] | None = None
+) -> str:
+    """nav_tree を navPoint の入れ子へ変換する（render_nav_list と同じ階層構造）。
+
+    playOrder は仕様上は任意（無くても epubcheck は通る）だが慣習的に付ける。
+    文書順（pre-order）に 1 から通し番号を振る。
+
+    ただし NCX では「同じ target を指す navPoint は同じ playOrder でなければならない」
+    という制約があり、素朴に通し番号を振ると同一 href が複数階層に現れたときに
+    epubcheck が RSC-005（different playOrder values ... refer to same target）で落ちる。
+    split_chapters_and_nav() は大見出しごとに別ファイル、中見出しには #id 断片を振るので
+    通常は衝突しないが、仕様に合わせて href ごとに採番を共有する（seen）。
+    id は navPoint 単位で一意である必要があるので、こちらは通し番号のまま。
+    """
+
+    if seen is None:
+        seen = {}
+    out = []
+    for node in nodes:
+        counter[0] += 1
+        # id は再帰の前に確定させる。子を先に描画すると counter が進んでしまい、
+        # 親の id が子の id と衝突する（RSC-005: id does not have a unique value）。
+        nid = counter[0]
+        n = seen.setdefault(node["href"], len(seen) + 1)
+        # navLabel/text はプレーンテキストのみ。<ruby> を入れると RSC-005 で落ちる。
+        label = render_plain(node["title"])
+        children = render_nav_points(node["children"], counter, indent + "  ", seen)
+        out.append(
+            f'{indent}<navPoint id="navPoint-{nid}" playOrder="{n}">\n'
+            f"{indent}  <navLabel><text>{label}</text></navLabel>\n"
+            f'{indent}  <content src="{escape_attr(node["href"])}"/>\n'
+            f"{children}"
+            f"{indent}</navPoint>\n"
+        )
+    return "".join(out)
+
+
+def render_ncx(nav_tree: list[dict], *, title: str, book_id: str, first_chapter_href: str | None) -> str:
+    """toc.ncx を組み立てる。
+
+    EPUB3 に NCX を併載しても epubcheck 5.1.0 は警告すら出さないが、2つの必須条件がある
+    （いずれも実測）:
+      - OPF の spine に toc="ncx" が必要（無いと RSC-005）
+      - dtb:uid が dc:identifier と完全一致していること（不一致だと NCX-001）
+    構造面では <head> に meta が最低1つ、<docTitle> が <navMap> より前に必要。
+    dtb:depth / dtb:totalPageCount / dtb:maxPageNumber と playOrder は任意だが慣習的に書く。
+
+    読み方向（縦書き）に相当する語彙は NCX 2005-1 には存在しない。組方向の指定箇所は
+    OPF の spine page-progression-direction が唯一なので、ここでは何もしない。
+    """
+
+    counter = [0]
+    nav_points = render_nav_points(nav_tree, counter)
+    if not nav_points:
+        # navMap は最低 1 つの navPoint が必要。nav.xhtml と同じフォールバックを出す。
+        href = escape_attr(first_chapter_href) if first_chapter_href else "nav.xhtml"
+        nav_points = (
+            '  <navPoint id="navPoint-1" playOrder="1">\n'
+            "    <navLabel><text>本文</text></navLabel>\n"
+            f'    <content src="{href}"/>\n'
+            "  </navPoint>\n"
+        )
+    return f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE ncx PUBLIC "-//NISO//DTD ncx 2005-1//EN" "http://www.daisy.org/z3986/2005/ncx-2005-1.dtd">
+<ncx xmlns="http://www.daisy.org/z3986/2005/ncx/" version="2005-1" xml:lang="ja">
+<head>
+<meta name="dtb:uid" content="{escape_attr(book_id)}"/>
+<meta name="dtb:depth" content="{max(nav_depth(nav_tree), 1)}"/>
+<meta name="dtb:totalPageCount" content="0"/>
+<meta name="dtb:maxPageNumber" content="0"/>
+</head>
+<docTitle><text>{render_plain(title)}</text></docTitle>
+<navMap>
+{nav_points}</navMap>
+</ncx>
+"""
+
+
+# --------------------------------------------------------------------------
 # CSS
 # --------------------------------------------------------------------------
 
 
 def build_css(horizontal: bool) -> str:
+    """縦書き（vertical-rl）／横書き（horizontal-tb）それぞれの style.css を組み立てる。
+
+    見出しの前後空きを margin-top/bottom で書くと、縦書きでは行内方向の余白に
+    なってしまい見出しの前後が詰まる。流れ方向に沿う論理プロパティ
+    （margin-block-start / margin-block-end）で指定する。
+    ただし -epub- / -webkit- 接頭辞を併記している通り古いエンジンも対象なので、
+    margin-block-* 非対応の環境で前後空きが消えないよう、同値の物理指定を
+    フォールバックとして先に置く（後続の論理指定が対応環境では上書きする）。
+    組方向は固定なので物理側の対応は静的に決まる：横書きは上下、縦書きは
+    vertical-rl なので block-start=右 / block-end=左。
+    """
+
     mode = "horizontal-tb" if horizontal else "vertical-rl"
+
+    def block_margin(start: str, end: str) -> str:
+        """見出しの流れ方向の前後空き。物理フォールバック→論理指定の順で置く。"""
+
+        # margin: 上 右 下 左
+        fallback = f"{start} 0 {end}" if horizontal else f"0 {start} 0 {end}"
+        return (
+            f"margin: {fallback}; "
+            f"margin-block-start: {start}; margin-block-end: {end};"
+        )
+
+    # 表・図版は縦書き本文の中でも横組みで読ませる。横書き時は本文と同じ組方向
+    # なので上書き自体が不要（class 名は XHTML 側で常に付くが CSS 側で分岐する）。
+    h_override = "" if horizontal else """table.h-table, figure.h-figure {
+  writing-mode: horizontal-tb;
+  -epub-writing-mode: horizontal-tb;
+  -webkit-writing-mode: horizontal-tb;
+}
+"""
+    # 表・図版は自身が horizontal-tb なので論理プロパティは本文の流れ方向と一致
+    # しない。前後空きは本文の組方向に合わせた物理プロパティで直接指定する。
+    block_gap = "1em 0" if horizontal else "0 1em"
+
+    # 縦中横は縦書きのときだけ意味を持つので、横書き時は規則ごと出さない。
+    # 宣言の順序は電書協標準 CSS に合わせる。レガシー接頭辞は値が horizontal で
+    # 標準の text-combine-upright とは別語彙なので、標準版を後に置いて上書きさせる。
+    # 表・図版は縦書き本文の中でも horizontal-tb に戻しているため、その中の縦中横は
+    # かえって有害。無効化する規則も併せて出す。
+    tcy_rules = "" if horizontal else """.tcy {
+  -webkit-text-combine: horizontal;
+  -webkit-text-combine-upright: all;
+  text-combine-upright: all;
+  -epub-text-combine: horizontal;
+}
+table.h-table .tcy, figure.h-figure .tcy {
+  text-combine-upright: none;
+  -webkit-text-combine: none;
+  -epub-text-combine: none;
+}
+"""
+
+    # 禁則・ぶら下げ。html, body ではなく別規則として置く（self_check は
+    # html, body ブロックを丸ごと切り出して中の writing-mode を全部拾うので、
+    # 無関係な宣言を紛れ込ませない）。どちらの宣言も継承するので body で足りる。
+    #   - line-break: strict は CJK で最も厳しい行分割規則。小書き仮名（っゃゅょ）
+    #     と長音符「ー」の行頭禁則が効く
+    #   - hanging-punctuation: allow-end は句読点のぶら下げ。実質 WebKit のみだが
+    #     未対応エンジンは無視するだけ
+    # font-feature-settings の vert / vrt2 と text-orientation・text-spacing は
+    # 意図的に書かない。vert は UA が自動適用する義務があり冗長、vrt2 は W3C 仕様が
+    # "is not used by CSS" と排除しており UA の回転と二重にかかる恐れがある。
+    # text-orientation は初期値 mixed が日本語縦組みの正解、text-spacing の normal は
+    # 約物詰めを抑制する逆効果。
+
     return f"""html, body {{
   writing-mode: {mode};
   -epub-writing-mode: {mode};
@@ -427,19 +673,20 @@ def build_css(horizontal: bool) -> str:
   font-family: "Noto Serif CJK JP", serif;
   line-height: 1.9;
 }}
-h1 {{ font-size: 1.6em; margin: 1.2em 0 0.6em; }}
-h2 {{ font-size: 1.3em; margin: 1em 0 0.5em; }}
-h3 {{ font-size: 1.1em; margin: 0.8em 0 0.4em; }}
+body {{
+  line-break: strict;
+  hanging-punctuation: allow-end;
+}}
+{tcy_rules}ruby {{ ruby-position: over; -webkit-ruby-position: over; -epub-ruby-position: over; }}
+rt {{ font-size: 0.5em; line-height: 1; }}
+h1 {{ font-size: 1.6em; {block_margin("1.2em", "0.6em")} }}
+h2 {{ font-size: 1.3em; {block_margin("1em", "0.5em")} }}
+h3 {{ font-size: 1.1em; {block_margin("0.8em", "0.4em")} }}
 p {{ margin: 0; text-indent: 1em; }}
 p.subtitle {{ text-indent: 0; font-size: 0.9em; }}
-table.h-table, figure.h-figure {{
-  writing-mode: horizontal-tb;
-  -epub-writing-mode: horizontal-tb;
-  -webkit-writing-mode: horizontal-tb;
-}}
-table.h-table {{ border-collapse: collapse; margin: 1em 0; }}
+{h_override}table.h-table {{ border-collapse: collapse; margin: {block_gap}; }}
 table.h-table th, table.h-table td {{ border: 1px solid #333; padding: 0.3em 0.6em; }}
-figure.h-figure {{ margin: 1em 0; text-align: center; }}
+figure.h-figure {{ margin: {block_gap}; text-align: center; }}
 figure.h-figure img {{ max-width: 100%; height: auto; }}
 """
 # landmarks nav は epub:type="landmarks" 属性に加え hidden="" 属性で隠しているため、
@@ -453,6 +700,17 @@ figure.h-figure img {{ max-width: 100%; height: auto; }}
 # --------------------------------------------------------------------------
 
 
+def primary_writing_mode(horizontal: bool) -> str:
+    """primary-writing-mode メタの値。
+
+    Kindle Publishing Guidelines が定める語彙は horizontal-lr / horizontal-rl /
+    vertical-lr / vertical-rl の4つで、CSS の writing-mode とは別物（進行方向を
+    含む）。日本語の横書きは horizontal-tb ではなく horizontal-lr。
+    """
+
+    return "horizontal-lr" if horizontal else "vertical-rl"
+
+
 def build_opf(
     *,
     title: str,
@@ -463,6 +721,7 @@ def build_opf(
     manifest_items: list[dict],
     spine_items: list[dict],
     horizontal: bool,
+    ncx_id: str | None = None,
 ) -> str:
     meta = [
         f'<dc:identifier id="pub-id">urn:uuid:{book_uuid}</dc:identifier>',
@@ -474,6 +733,15 @@ def build_opf(
     if publisher:
         meta.append(f"<dc:publisher>{escape(publisher)}</dc:publisher>")
     meta.append(f'<meta property="dcterms:modified">{modified}</meta>')
+    # Kindle や日本語ビューアが本の既定の組方向を判断するための拡張メタ。
+    # spine の page-progression-direction だけではページ送り方向しか伝わらない。
+    # EPUB3 の property 属性は既定語彙にある名前しか取れず、接頭辞なしの
+    # primary-writing-mode は epubcheck が OPF-027 で弾く。Kindle が実際に読むのも
+    # OPF2 由来の name/content 形式なので、そちらで出力する。
+    # 値は CSS の writing-mode ではなく Kindle の語彙（進行方向込み）に従う。
+    meta.append(
+        f'<meta name="primary-writing-mode" content="{primary_writing_mode(horizontal)}"/>'
+    )
 
     manifest = "\n".join(
         f'<item id="{it["id"]}" href="{it["href"]}" media-type="{it["media_type"]}"'
@@ -481,7 +749,10 @@ def build_opf(
         + "/>"
         for it in manifest_items
     )
-    spine_attr = "" if horizontal else ' page-progression-direction="rtl"'
+    # NCX を manifest に入れたら spine の toc 属性が必須（無いと epubcheck が RSC-005）。
+    # NCX 自体は spine に itemref として並べない。
+    spine_attr = f' toc="{ncx_id}"' if ncx_id else ""
+    spine_attr += "" if horizontal else ' page-progression-direction="rtl"'
     spine = "\n".join(
         f'<itemref idref="{it["idref"]}"'
         + (f' linear="{it["linear"]}"' if it.get("linear") else "")
@@ -535,8 +806,12 @@ def render_cover_png(pdf_path: Path, page_no: int, dpi: int) -> bytes:
 # --------------------------------------------------------------------------
 
 
-def self_check(epub_path: Path) -> list[str]:
-    """生成した EPUB を zip 構造・XML 整形式・manifest/spine 突合の観点で検証する"""
+def self_check(epub_path: Path, horizontal: bool = False) -> list[str]:
+    """生成した EPUB を zip 構造・XML 整形式・manifest/spine 突合・縦横整合の観点で検証する
+
+    縦横整合は style.css の writing-mode、spine の page-progression-direction、
+    primary-writing-mode メタの3点が `horizontal` と食い違っていないかを見る。
+    """
 
     problems: list[str] = []
     with zipfile.ZipFile(epub_path) as zf:
@@ -579,10 +854,96 @@ def self_check(epub_path: Path) -> list[str]:
                 problems.append(f"manifest 項目 {id_} のファイルが zip にありません: {full}")
 
         spine = root.find("opf:spine", ns)
+        if spine is None:
+            problems.append("package.opf に spine がありません")
+            return problems
         for itemref in spine:
             idref = itemref.get("idref")
             if idref not in manifest_items:
                 problems.append(f"spine の idref が manifest にありません: {idref}")
+
+        # --- NCX（EPUB2 互換）---
+        # NCX を manifest に入れたら spine の toc 属性で指す必要があり（無いと RSC-005）、
+        # dtb:uid は dc:identifier と完全一致していなければならない（不一致だと NCX-001）。
+        ncx_ids = [
+            item.get("id")
+            for item in root.find("opf:manifest", ns)
+            if item.get("media-type") == "application/x-dtbncx+xml"
+        ]
+        toc_attr = spine.get("toc")
+        if ncx_ids and toc_attr not in ncx_ids:
+            problems.append(
+                f"NCX が manifest にあるのに spine の toc 属性が指していません: {toc_attr!r}"
+            )
+        elif not ncx_ids and toc_attr is not None:
+            problems.append(f"spine の toc 属性が指す NCX が manifest にありません: {toc_attr!r}")
+
+        if ncx_ids and toc_attr in ncx_ids:
+            ncx_href = manifest_items[toc_attr]
+            ncx_full = f"{opf_dir}/{ncx_href}" if opf_dir not in ("", ".") else ncx_href
+            if ncx_full in names:
+                uid_attr = root.get("unique-identifier")
+                book_ids = [
+                    (e.text or "").strip()
+                    for e in root.iterfind(
+                        "opf:metadata/{http://purl.org/dc/elements/1.1/}identifier", ns
+                    )
+                    if e.get("id") == uid_attr
+                ]
+                ncx_root = ET.fromstring(zf.read(ncx_full))
+                dtb_uid = [
+                    (m.get("content") or "").strip()
+                    for m in ncx_root.iterfind(
+                        "{http://www.daisy.org/z3986/2005/ncx/}head/"
+                        "{http://www.daisy.org/z3986/2005/ncx/}meta"
+                    )
+                    if m.get("name") == "dtb:uid"
+                ]
+                if dtb_uid != book_ids:
+                    problems.append(
+                        f"NCX の dtb:uid が dc:identifier と一致しません: "
+                        f"{dtb_uid}（期待: {book_ids}）"
+                    )
+
+        # --- 縦横整合 ---
+        expected_mode = "horizontal-tb" if horizontal else "vertical-rl"
+
+        css_path = f"{opf_dir}/style.css" if opf_dir not in ("", ".") else "style.css"
+        if css_path not in names:
+            problems.append(f"style.css が見つかりません: {css_path}")
+        else:
+            css = zf.read(css_path).decode("utf-8")
+            body_rule = re.search(r"html,\s*body\s*\{([^}]*)\}", css)
+            if body_rule is None:
+                problems.append("style.css に html, body の規則がありません")
+            else:
+                # ベンダー接頭辞付き（-epub- / -webkit-）も含め、すべて同じ値であること
+                modes = [v.strip() for v in re.findall(r"writing-mode:\s*([^;]+);", body_rule.group(1))]
+                if not modes:
+                    problems.append("style.css の html, body に writing-mode がありません")
+                elif any(v != expected_mode for v in modes):
+                    problems.append(
+                        f"style.css の writing-mode が期待値と異なります: {modes}（期待: {expected_mode}）"
+                    )
+
+        expected_ppd = None if horizontal else "rtl"
+        ppd = spine.get("page-progression-direction")
+        if ppd != expected_ppd:
+            problems.append(
+                f"spine の page-progression-direction が期待値と異なります: "
+                f"{ppd!r}（期待: {expected_ppd!r}）"
+            )
+
+        expected_pwm = primary_writing_mode(horizontal)
+        pwm = [
+            (m.get("content") or "").strip()
+            for m in root.iterfind("opf:metadata/opf:meta", ns)
+            if m.get("name") == "primary-writing-mode"
+        ]
+        if pwm != [expected_pwm]:
+            problems.append(
+                f"primary-writing-mode メタが期待値と異なります: {pwm}（期待: [{expected_pwm!r}]）"
+            )
 
         for name in names:
             if name == "mimetype" or name.startswith("META-INF/"):
@@ -630,6 +991,8 @@ def build_epub(
         blocks = apply_fixes(blocks, fixes)
 
     chapters, nav_tree = split_chapters_and_nav(blocks)
+    book_uuid = str(uuid.uuid4())
+    book_id = f"urn:uuid:{book_uuid}"
     n_tables = sum(1 for b in blocks if b["kind"] == "table")
     n_figures = sum(1 for b in blocks if b["kind"] == "figure")
 
@@ -661,6 +1024,11 @@ def build_epub(
     manifest_items.append({"id": "nav", "href": "nav.xhtml", "media_type": "application/xhtml+xml", "properties": "nav"})
     spine_items.append({"idref": "nav", "linear": "no"})
 
+    # --- toc.ncx（EPUB2 互換リーダー向け。nav.xhtml と同じツリーから作る）---
+    ncx = render_ncx(nav_tree, title=title, book_id=book_id, first_chapter_href=first_href)
+    files[f"OEBPS/{NCX_HREF}"] = ncx.encode("utf-8")
+    manifest_items.append({"id": NCX_ID, "href": NCX_HREF, "media_type": NCX_MEDIA_TYPE})
+
     # --- 図版切り出し ---
     fig_jobs = [
         {"page": b["page"], "box": b["box"], "name": b["src"]} for b in blocks if b["kind"] == "figure"
@@ -689,11 +1057,12 @@ def build_epub(
         title=title,
         author=author,
         publisher=publisher,
-        book_uuid=str(uuid.uuid4()),
+        book_uuid=book_uuid,
         modified=modified,
         manifest_items=manifest_items,
         spine_items=spine_items,
         horizontal=horizontal,
+        ncx_id=NCX_ID,
     )
     files["OEBPS/package.opf"] = opf.encode("utf-8")
 
@@ -712,7 +1081,7 @@ def build_epub(
     print(f"  章ファイル数: {len(chapters)} / 表: {n_tables} / 図版: {n_figures}")
     print(f"  nav 第1階層: {len(nav_tree)} 項目")
 
-    problems = self_check(out_path)
+    problems = self_check(out_path, horizontal=horizontal)
     if problems:
         print("self-check: FAIL")
         for p in problems:

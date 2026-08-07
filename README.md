@@ -9,7 +9,7 @@
 |---|---|
 | `ocr_book.py` | PDF をページ単位で OCR して JSON にキャッシュ |
 | `book_ir.py` | OCR JSON → 中間表現（IR）。ルビ結合・見出し判定・図版切り出しの共有レイヤー |
-| `to_epub.py` | IR → EPUB3（縦書き・nav.xhtml 階層目次・ruby/table/img・self-check 内蔵） |
+| `to_epub.py` | IR → EPUB3（縦書き・nav.xhtml 階層目次＋EPUB2 互換 toc.ncx・ruby/table/img・self-check 内蔵） |
 | `to_aozora.py` | IR → 青空文庫形式テキスト（任意出力） |
 | `llm_proofread.py` | `claude -p` による OCR 誤認識の校正（チャンク並列・キャッシュ・検証付き適用） |
 | `pdf_to_epub.py` | 目次先行 OCR → 章境界確定 → 章ごとに OCR+校正を並列 → EPUB 生成のオーケストレーター |
@@ -32,6 +32,18 @@ uv run --project "$PIPE" python "$PIPE/pdf_to_epub.py" -p "BOOK.pdf" \
 # 3. 検証
 epubcheck "書名.epub"
 ```
+
+### 主なオプション
+
+- `--title` / `--author` / `--publisher`: 書誌情報。`--title` は `--dry-run` 以外で必須
+- `--toc-pages` / `--page-offset`: 印刷目次のページ範囲と、書籍ページ番号→PDF ページ番号の補正
+- `--horizontal`: 横書き（`horizontal-tb`）で出力する。既定は縦書き（`vertical-rl`）。
+  縦書きでは spine に `page-progression-direction="rtl"` が付き、
+  `primary-writing-mode` メタが `vertical-rl` になる。`--horizontal` 指定時は
+  `page-progression-direction` を付けず（既定の `ltr`）、メタは `horizontal-lr` になる
+- `--dry-run`: 章境界の確認まで（LLM 校正を行わないので課金なし）
+
+`--horizontal` は `pdf_to_epub.py` と `to_epub.py` の両方で同じ意味で使える。
 
 詳細な手順・引数の決め方・中断再開の方法は
 [.claude/skills/pdf-to-epub/SKILL.md](.claude/skills/pdf-to-epub/SKILL.md) を参照。
