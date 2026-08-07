@@ -38,8 +38,9 @@ epubcheck "書名.epub"
 - `--title` / `--author` / `--publisher`: 書誌情報。`--title` は `--dry-run` 以外で必須
 - `--toc-pages` / `--page-offset`: 印刷目次のページ範囲と、書籍ページ番号→PDF ページ番号の補正
 - `--horizontal`: 横書き（`horizontal-tb`）で出力する。既定は縦書き（`vertical-rl`）。
-  縦書き既定では spine に `page-progression-direction="rtl"` が付き、
-  `primary-writing-mode` メタも縦書きになる（`--horizontal` 指定時はどちらも横書き向けになる）
+  縦書きでは spine に `page-progression-direction="rtl"` が付き、
+  `primary-writing-mode` メタが `vertical-rl` になる。`--horizontal` 指定時は
+  `page-progression-direction` を付けず（既定の `ltr`）、メタは `horizontal-lr` になる
 - `--dry-run`: 章境界の確認まで（LLM 校正を行わないので課金なし）
 
 `--horizontal` は `pdf_to_epub.py` と `to_epub.py` の両方で同じ意味で使える。

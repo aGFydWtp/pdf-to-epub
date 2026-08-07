@@ -423,18 +423,25 @@ def build_css(horizontal: bool) -> str:
 
     見出しの前後空きを margin-top/bottom で書くと、縦書きでは行内方向の余白に
     なってしまい見出しの前後が詰まる。流れ方向に沿う論理プロパティ
-    （margin-block-start / margin-block-end）で指定し、横書き時だけは論理
-    プロパティ非対応の古いビューア向けに同値の物理指定をフォールバックとして
-    併記する（縦書き時は物理指定を出さない＝壊れる指定を残さない）。
+    （margin-block-start / margin-block-end）で指定する。
+    ただし -epub- / -webkit- 接頭辞を併記している通り古いエンジンも対象なので、
+    margin-block-* 非対応の環境で前後空きが消えないよう、同値の物理指定を
+    フォールバックとして先に置く（後続の論理指定が対応環境では上書きする）。
+    組方向は固定なので物理側の対応は静的に決まる：横書きは上下、縦書きは
+    vertical-rl なので block-start=右 / block-end=左。
     """
 
     mode = "horizontal-tb" if horizontal else "vertical-rl"
 
     def block_margin(start: str, end: str) -> str:
-        """見出しの流れ方向の前後空き。横書き時のみ物理プロパティを先に置く。"""
+        """見出しの流れ方向の前後空き。物理フォールバック→論理指定の順で置く。"""
 
-        fallback = f"margin: {start} 0 {end}; " if horizontal else ""
-        return f"{fallback}margin-block-start: {start}; margin-block-end: {end};"
+        # margin: 上 右 下 左
+        fallback = f"{start} 0 {end}" if horizontal else f"0 {start} 0 {end}"
+        return (
+            f"margin: {fallback}; "
+            f"margin-block-start: {start}; margin-block-end: {end};"
+        )
 
     # 表・図版は縦書き本文の中でも横組みで読ませる。横書き時は本文と同じ組方向
     # なので上書き自体が不要（class 名は XHTML 側で常に付くが CSS 側で分岐する）。
@@ -476,6 +483,17 @@ figure.h-figure img {{ max-width: 100%; height: auto; }}
 # --------------------------------------------------------------------------
 
 
+def primary_writing_mode(horizontal: bool) -> str:
+    """primary-writing-mode メタの値。
+
+    Kindle Publishing Guidelines が定める語彙は horizontal-lr / horizontal-rl /
+    vertical-lr / vertical-rl の4つで、CSS の writing-mode とは別物（進行方向を
+    含む）。日本語の横書きは horizontal-tb ではなく horizontal-lr。
+    """
+
+    return "horizontal-lr" if horizontal else "vertical-rl"
+
+
 def build_opf(
     *,
     title: str,
@@ -499,8 +517,12 @@ def build_opf(
     meta.append(f'<meta property="dcterms:modified">{modified}</meta>')
     # Kindle や日本語ビューアが本の既定の組方向を判断するための拡張メタ。
     # spine の page-progression-direction だけではページ送り方向しか伝わらない。
+    # EPUB3 の property 属性は既定語彙にある名前しか取れず、接頭辞なしの
+    # primary-writing-mode は epubcheck が OPF-027 で弾く。Kindle が実際に読むのも
+    # OPF2 由来の name/content 形式なので、そちらで出力する。
+    # 値は CSS の writing-mode ではなく Kindle の語彙（進行方向込み）に従う。
     meta.append(
-        f'<meta property="primary-writing-mode">{"horizontal-tb" if horizontal else "vertical-rl"}</meta>'
+        f'<meta name="primary-writing-mode" content="{primary_writing_mode(horizontal)}"/>'
     )
 
     manifest = "\n".join(
@@ -611,6 +633,9 @@ def self_check(epub_path: Path, horizontal: bool = False) -> list[str]:
                 problems.append(f"manifest 項目 {id_} のファイルが zip にありません: {full}")
 
         spine = root.find("opf:spine", ns)
+        if spine is None:
+            problems.append("package.opf に spine がありません")
+            return problems
         for itemref in spine:
             idref = itemref.get("idref")
             if idref not in manifest_items:
@@ -645,14 +670,15 @@ def self_check(epub_path: Path, horizontal: bool = False) -> list[str]:
                 f"{ppd!r}（期待: {expected_ppd!r}）"
             )
 
+        expected_pwm = primary_writing_mode(horizontal)
         pwm = [
-            (m.text or "").strip()
+            (m.get("content") or "").strip()
             for m in root.iterfind("opf:metadata/opf:meta", ns)
-            if m.get("property") == "primary-writing-mode"
+            if m.get("name") == "primary-writing-mode"
         ]
-        if pwm != [expected_mode]:
+        if pwm != [expected_pwm]:
             problems.append(
-                f"primary-writing-mode メタが期待値と異なります: {pwm}（期待: [{expected_mode!r}]）"
+                f"primary-writing-mode メタが期待値と異なります: {pwm}（期待: [{expected_pwm!r}]）"
             )
 
         for name in names:
