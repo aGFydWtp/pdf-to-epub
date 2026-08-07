@@ -66,12 +66,91 @@ spine の `page-progression-direction`）だけで、**縦書き側にも実バ�
 nav.xhtml の `<a>` 内には `<ruby>` を置けるので `render_inline()` を通すよう変更した
 （epubcheck 実測済み）。
 
-### フェーズ3: リーダー互換性（未着手）
+### フェーズ3: リーダー互換性（完了）
 
 | # | 項目 | 状態 | 備考 |
 |---|---|---|---|
-| 3-1 | `rendition:*` メタ＋`prefix` 宣言 | 🔜 未着手 | 縦書き固有ではない |
-| 3-2 | NCX（toc.ncx）の生成 | 🔜 未着手 | EPUB2 互換リーダー向け |
+| 3-1 | `rendition:*` メタ＋`prefix` 宣言 | ❌ 実装しない | 全部 EPUB3 の既定値。下記参照 |
+| 3-2 | NCX（toc.ncx）の生成 | ✅ done | EPUB2 互換リーダー向け。下記参照 |
+| 3-3 | `self_check()` に NCX の検証を追加 | ✅ done | toc 属性と `dtb:uid` 一致を見る |
+| 3-4 | `playOrder` / `id` の一意性修正 | ✅ done | epubcheck で検出。下記参照 |
+
+**3-4 は epubcheck の実測で見つけた退行。** NCX には「**同じ target を指す navPoint は
+同じ `playOrder` でなければならない**」という制約があり、文書順の通し番号を素朴に振ると
+同一 href が複数階層に現れたとき `RSC-005`（different playOrder values ... refer to same
+target）で落ちる。`split_chapters_and_nav()` は大見出しごとに別ファイル・中見出しには
+`#id` 断片を振るので通常は衝突しないが、仕様に合わせて href ごとに採番を共有するよう修正した。
+
+併せて `id` の採番位置も修正。子を先に描画してから `counter` を読むと親の id が子と衝突し
+`RSC-005`（id does not have a unique value）になる。id は再帰の**前**に確定させる。
+
+---
+
+## 3-1 `rendition:*` を実装しない理由
+
+epubcheck 5.1.0 で対照実験した結果、**書く実益がない**と判断した。
+
+- `rendition:` は EPUB3 の**予約接頭辞**なので `prefix` 属性は不要。独自接頭辞
+  （`foo:`）は未宣言だと `OPF-028` で落ちるが、`rendition:` は宣言なしで通る
+- リフロー型で妥当な値は `rendition:layout=reflowable` / `rendition:spread=auto` /
+  `rendition:orientation=auto` の3つだが、**いずれも EPUB3 の既定値そのもの**。
+  明示してもリーダーの挙動は変わらない
+- `pre-paginated` は**指定してはいけない**。全 XHTML に viewport meta が必要になり
+  `ERROR(HTM-046)` が出る。OCR 由来のリフロー書籍とは非互換
+- itemref の `rendition:page-spread-left` / `-right` は固定レイアウト専用で、
+  リフローでは効果がない
+
+縦書きの見開き方向を伝えるのは spine の `page-progression-direction="rtl"` と
+`primary-writing-mode` メタ（フェーズ1で実装済み）で足りている。
+
+---
+
+## 3-2 NCX の実装メモ
+
+EPUB3 の `nav.xhtml` は EPUB2 世代の日本語ビューアが読まないため、目次が出ない。
+同じ `nav_tree` から `toc.ncx` を生成して併載する（`render_ncx()`）。
+**EPUB3 に NCX を入れても epubcheck 5.1.0 は警告すら出さない**（実測）。ただし条件がある。
+
+### 必須条件（外すと epubcheck が落ちる。実測済み）
+
+| 条件 | 外したときのエラー |
+|---|---|
+| spine に `toc="ncx"` 属性 | `ERROR(RSC-005)` spine element toc attribute must be set… |
+| `dtb:uid` が `dc:identifier` と完全一致 | `ERROR(NCX-001)` NCX identifier does not match OPF identifier |
+| `<head>` に meta が最低1つ | `ERROR(RSC-005)` element "head" incomplete; missing required element "meta" |
+| `<docTitle>` が `<navMap>` より前 | `ERROR(RSC-005)` element "navMap" not allowed yet; missing required element "docTitle" |
+
+manifest は `media-type="application/x-dtbncx+xml"` で登録する。**NCX を spine に
+itemref として並べる必要はなく、`properties` も不要。**
+`dtb:depth` / `dtb:totalPageCount` / `dtb:maxPageNumber` と `playOrder` は任意
+（`dtb:uid` だけでも通る）だが慣習的に書いている。
+
+### 最重要: nav.xhtml と同じ文字列を流してはいけない
+
+**`navLabel/text` はプレーンテキストのみで、マークアップを一切許さない。**
+
+```
+ERROR(RSC-005): element "ruby" not allowed anywhere; expected the element end-tag or text
+```
+
+フェーズ2 の 2-6 で `render_nav_list()` を `render_inline()` 経由に変えたため、
+nav.xhtml の `<a>` の中には `<ruby>` と縦中横の `<span>` が入っている。NCX にはこれを
+流せないので、テキスト化の関数を分けている。
+
+| 出力先 | 関数 | 挙動 |
+|---|---|---|
+| nav.xhtml | `render_inline()` | `｜天体《てんたい》` → `<ruby>天体<rt>てんたい</rt></ruby>` |
+| toc.ncx | `render_plain()` | `｜天体《てんたい》` → `天体`（ルビ部を捨て親文字だけ残す） |
+
+`render_plain()` は `RUBY_PIPE_RE` / `RUBY_BARE_RE` を再利用する。`RUBY_PIPE_RE` は
+`｜親《ルビ》` 全体にマッチするので親文字への置換で `｜` ごと消えるが、ルビ開始記号
+として使われなかった裸の `｜` は残るため最後にまとめて除去している。
+
+### NCX に縦書き固有の指定はない
+
+NCX（DAISY 2005-1）の語彙に `page-progression-direction` 相当は**存在しない**。
+読み方向の指定箇所は OPF の spine `page-progression-direction="rtl"` が唯一で、
+NCX 側は何もしなくてよい。
 
 ---
 
@@ -137,7 +216,9 @@ epubcheck "書名.epub"
 
 `build_epub()` が毎回自動実行する。zip 構造・XML 整形式・manifest/spine 突合に加え、
 縦横整合（CSS の `writing-mode` / `page-progression-direction` / `primary-writing-mode`）
-を検証する。FAIL 時は `sys.exit(1)`。
+と NCX 整合（manifest 登録・spine の `toc` 属性・`dtb:uid` と `dc:identifier` の一致）
+を検証する。NCX の2項目は epubcheck の `RSC-005` / `NCX-001` に対応しており、
+epubcheck を回す前にローカルで同じ退行を捕まえられる。FAIL 時は `sys.exit(1)`。
 
 ---
 

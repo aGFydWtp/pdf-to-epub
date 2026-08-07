@@ -9,7 +9,7 @@
 |---|---|
 | `ocr_book.py` | PDF をページ単位で OCR して JSON にキャッシュ |
 | `book_ir.py` | OCR JSON → 中間表現（IR）。ルビ結合・見出し判定・図版切り出しの共有レイヤー |
-| `to_epub.py` | IR → EPUB3（縦書き・nav.xhtml 階層目次・ruby/table/img・self-check 内蔵） |
+| `to_epub.py` | IR → EPUB3（縦書き・nav.xhtml 階層目次＋EPUB2 互換 toc.ncx・ruby/table/img・self-check 内蔵） |
 | `to_aozora.py` | IR → 青空文庫形式テキスト（任意出力） |
 | `llm_proofread.py` | `claude -p` による OCR 誤認識の校正（チャンク並列・キャッシュ・検証付き適用） |
 | `pdf_to_epub.py` | 目次先行 OCR → 章境界確定 → 章ごとに OCR+校正を並列 → EPUB 生成のオーケストレーター |

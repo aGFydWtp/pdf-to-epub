@@ -3,6 +3,7 @@
 主な処理:
   - book_ir.build_ir() で IR ブロック列を構築し、印刷目次ページを既定で除外
   - 大見出しごとに XHTML を分割し、「部」「大見出し」「中見出し」の3階層 nav.xhtml を構築
+  - 同じ目次ツリーから EPUB2 互換リーダー向けの toc.ncx を併載する
   - ｜親《ルビ》記法を <ruby><rp><rt> へ変換し、半角2桁の数字などを縦中横（.tcy）で立てる
   - 表セル構造を <table>（rowspan/colspan 付き）へ、図版を crop_figures で切り出して <img> へ
   - PDF 1ページ目をカバー画像としてレンダリング
@@ -77,6 +78,26 @@ def render_inline(text: str) -> str:
     escaped = RUBY_PIPE_RE.sub(ruby, escaped)
     escaped = RUBY_BARE_RE.sub(ruby, escaped)
     return add_tcy(escaped)
+
+
+def render_plain(text: str) -> str:
+    """｜親《ルビ》記法をプレーンテキスト化する（エスケープ込み・タグを一切出さない）。
+
+    NCX の navLabel/text はマークアップを一切許さない語彙で、<ruby> を入れると
+    epubcheck が RSC-005 で弾く（実測）。nav.xhtml 用の render_inline() と違い、
+    ルビ部《…》を捨てて親文字だけを残す。
+      '第12章｜天体《てんたい》の運行' → '第12章天体の運行'
+
+    RUBY_PIPE_RE は '｜親《ルビ》' 全体にマッチするので親文字への置換で ｜ ごと
+    消える。ルビの開始記号として使われなかった裸の ｜ は正規表現に拾われずに
+    残るため、最後にまとめて除去する（青空文庫記法では ｜ はルビ開始記号専用で、
+    本文の文字として現れることはない）。
+    """
+
+    escaped = escape(text)
+    escaped = RUBY_PIPE_RE.sub(lambda m: m.group(1), escaped)
+    escaped = RUBY_BARE_RE.sub(lambda m: m.group(1), escaped)
+    return escaped.replace("｜", "")
 
 
 def escape_attr(text: str) -> str:
@@ -452,6 +473,100 @@ def render_nav_xhtml(nav_tree: list[dict], first_chapter_href: str | None) -> st
 
 
 # --------------------------------------------------------------------------
+# toc.ncx（EPUB2 互換）
+# --------------------------------------------------------------------------
+
+NCX_ID = "ncx"
+NCX_HREF = "toc.ncx"
+NCX_MEDIA_TYPE = "application/x-dtbncx+xml"
+
+
+def nav_depth(nodes: list[dict]) -> int:
+    """目次ツリーの最大階層数（dtb:depth 用）。空なら 0。"""
+
+    return max((1 + nav_depth(n["children"]) for n in nodes), default=0)
+
+
+def render_nav_points(
+    nodes: list[dict], counter: list[int], indent: str = "  ", seen: dict[str, int] | None = None
+) -> str:
+    """nav_tree を navPoint の入れ子へ変換する（render_nav_list と同じ階層構造）。
+
+    playOrder は仕様上は任意（無くても epubcheck は通る）だが慣習的に付ける。
+    文書順（pre-order）に 1 から通し番号を振る。
+
+    ただし NCX では「同じ target を指す navPoint は同じ playOrder でなければならない」
+    という制約があり、素朴に通し番号を振ると同一 href が複数階層に現れたときに
+    epubcheck が RSC-005（different playOrder values ... refer to same target）で落ちる。
+    split_chapters_and_nav() は大見出しごとに別ファイル、中見出しには #id 断片を振るので
+    通常は衝突しないが、仕様に合わせて href ごとに採番を共有する（seen）。
+    id は navPoint 単位で一意である必要があるので、こちらは通し番号のまま。
+    """
+
+    if seen is None:
+        seen = {}
+    out = []
+    for node in nodes:
+        counter[0] += 1
+        # id は再帰の前に確定させる。子を先に描画すると counter が進んでしまい、
+        # 親の id が子の id と衝突する（RSC-005: id does not have a unique value）。
+        nid = counter[0]
+        n = seen.setdefault(node["href"], len(seen) + 1)
+        # navLabel/text はプレーンテキストのみ。<ruby> を入れると RSC-005 で落ちる。
+        label = render_plain(node["title"])
+        children = render_nav_points(node["children"], counter, indent + "  ", seen)
+        out.append(
+            f'{indent}<navPoint id="navPoint-{nid}" playOrder="{n}">\n'
+            f"{indent}  <navLabel><text>{label}</text></navLabel>\n"
+            f'{indent}  <content src="{escape_attr(node["href"])}"/>\n'
+            f"{children}"
+            f"{indent}</navPoint>\n"
+        )
+    return "".join(out)
+
+
+def render_ncx(nav_tree: list[dict], *, title: str, book_id: str, first_chapter_href: str | None) -> str:
+    """toc.ncx を組み立てる。
+
+    EPUB3 に NCX を併載しても epubcheck 5.1.0 は警告すら出さないが、2つの必須条件がある
+    （いずれも実測）:
+      - OPF の spine に toc="ncx" が必要（無いと RSC-005）
+      - dtb:uid が dc:identifier と完全一致していること（不一致だと NCX-001）
+    構造面では <head> に meta が最低1つ、<docTitle> が <navMap> より前に必要。
+    dtb:depth / dtb:totalPageCount / dtb:maxPageNumber と playOrder は任意だが慣習的に書く。
+
+    読み方向（縦書き）に相当する語彙は NCX 2005-1 には存在しない。組方向の指定箇所は
+    OPF の spine page-progression-direction が唯一なので、ここでは何もしない。
+    """
+
+    counter = [0]
+    nav_points = render_nav_points(nav_tree, counter)
+    if not nav_points:
+        # navMap は最低 1 つの navPoint が必要。nav.xhtml と同じフォールバックを出す。
+        href = escape_attr(first_chapter_href) if first_chapter_href else "nav.xhtml"
+        nav_points = (
+            '  <navPoint id="navPoint-1" playOrder="1">\n'
+            "    <navLabel><text>本文</text></navLabel>\n"
+            f'    <content src="{href}"/>\n'
+            "  </navPoint>\n"
+        )
+    return f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE ncx PUBLIC "-//NISO//DTD ncx 2005-1//EN" "http://www.daisy.org/z3986/2005/ncx-2005-1.dtd">
+<ncx xmlns="http://www.daisy.org/z3986/2005/ncx/" version="2005-1" xml:lang="ja">
+<head>
+<meta name="dtb:uid" content="{escape_attr(book_id)}"/>
+<meta name="dtb:depth" content="{max(nav_depth(nav_tree), 1)}"/>
+<meta name="dtb:totalPageCount" content="0"/>
+<meta name="dtb:maxPageNumber" content="0"/>
+</head>
+<docTitle><text>{render_plain(title)}</text></docTitle>
+<navMap>
+{nav_points}</navMap>
+</ncx>
+"""
+
+
+# --------------------------------------------------------------------------
 # CSS
 # --------------------------------------------------------------------------
 
@@ -579,6 +694,7 @@ def build_opf(
     manifest_items: list[dict],
     spine_items: list[dict],
     horizontal: bool,
+    ncx_id: str | None = None,
 ) -> str:
     meta = [
         f'<dc:identifier id="pub-id">urn:uuid:{book_uuid}</dc:identifier>',
@@ -606,7 +722,10 @@ def build_opf(
         + "/>"
         for it in manifest_items
     )
-    spine_attr = "" if horizontal else ' page-progression-direction="rtl"'
+    # NCX を manifest に入れたら spine の toc 属性が必須（無いと epubcheck が RSC-005）。
+    # NCX 自体は spine に itemref として並べない。
+    spine_attr = f' toc="{ncx_id}"' if ncx_id else ""
+    spine_attr += "" if horizontal else ' page-progression-direction="rtl"'
     spine = "\n".join(
         f'<itemref idref="{it["idref"]}"'
         + (f' linear="{it["linear"]}"' if it.get("linear") else "")
@@ -716,6 +835,49 @@ def self_check(epub_path: Path, horizontal: bool = False) -> list[str]:
             if idref not in manifest_items:
                 problems.append(f"spine の idref が manifest にありません: {idref}")
 
+        # --- NCX（EPUB2 互換）---
+        # NCX を manifest に入れたら spine の toc 属性で指す必要があり（無いと RSC-005）、
+        # dtb:uid は dc:identifier と完全一致していなければならない（不一致だと NCX-001）。
+        ncx_ids = [
+            item.get("id")
+            for item in root.find("opf:manifest", ns)
+            if item.get("media-type") == "application/x-dtbncx+xml"
+        ]
+        toc_attr = spine.get("toc")
+        if ncx_ids and toc_attr not in ncx_ids:
+            problems.append(
+                f"NCX が manifest にあるのに spine の toc 属性が指していません: {toc_attr!r}"
+            )
+        elif not ncx_ids and toc_attr is not None:
+            problems.append(f"spine の toc 属性が指す NCX が manifest にありません: {toc_attr!r}")
+
+        if ncx_ids and toc_attr in ncx_ids:
+            ncx_href = manifest_items[toc_attr]
+            ncx_full = f"{opf_dir}/{ncx_href}" if opf_dir not in ("", ".") else ncx_href
+            if ncx_full in names:
+                uid_attr = root.get("unique-identifier")
+                book_ids = [
+                    (e.text or "").strip()
+                    for e in root.iterfind(
+                        "opf:metadata/{http://purl.org/dc/elements/1.1/}identifier", ns
+                    )
+                    if e.get("id") == uid_attr
+                ]
+                ncx_root = ET.fromstring(zf.read(ncx_full))
+                dtb_uid = [
+                    (m.get("content") or "").strip()
+                    for m in ncx_root.iterfind(
+                        "{http://www.daisy.org/z3986/2005/ncx/}head/"
+                        "{http://www.daisy.org/z3986/2005/ncx/}meta"
+                    )
+                    if m.get("name") == "dtb:uid"
+                ]
+                if dtb_uid != book_ids:
+                    problems.append(
+                        f"NCX の dtb:uid が dc:identifier と一致しません: "
+                        f"{dtb_uid}（期待: {book_ids}）"
+                    )
+
         # --- 縦横整合 ---
         expected_mode = "horizontal-tb" if horizontal else "vertical-rl"
 
@@ -802,6 +964,8 @@ def build_epub(
         blocks = apply_fixes(blocks, fixes)
 
     chapters, nav_tree = split_chapters_and_nav(blocks)
+    book_uuid = str(uuid.uuid4())
+    book_id = f"urn:uuid:{book_uuid}"
     n_tables = sum(1 for b in blocks if b["kind"] == "table")
     n_figures = sum(1 for b in blocks if b["kind"] == "figure")
 
@@ -833,6 +997,11 @@ def build_epub(
     manifest_items.append({"id": "nav", "href": "nav.xhtml", "media_type": "application/xhtml+xml", "properties": "nav"})
     spine_items.append({"idref": "nav", "linear": "no"})
 
+    # --- toc.ncx（EPUB2 互換リーダー向け。nav.xhtml と同じツリーから作る）---
+    ncx = render_ncx(nav_tree, title=title, book_id=book_id, first_chapter_href=first_href)
+    files[f"OEBPS/{NCX_HREF}"] = ncx.encode("utf-8")
+    manifest_items.append({"id": NCX_ID, "href": NCX_HREF, "media_type": NCX_MEDIA_TYPE})
+
     # --- 図版切り出し ---
     fig_jobs = [
         {"page": b["page"], "box": b["box"], "name": b["src"]} for b in blocks if b["kind"] == "figure"
@@ -861,11 +1030,12 @@ def build_epub(
         title=title,
         author=author,
         publisher=publisher,
-        book_uuid=str(uuid.uuid4()),
+        book_uuid=book_uuid,
         modified=modified,
         manifest_items=manifest_items,
         spine_items=spine_items,
         horizontal=horizontal,
+        ncx_id=NCX_ID,
     )
     files["OEBPS/package.opf"] = opf.encode("utf-8")
 
