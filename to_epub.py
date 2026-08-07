@@ -3,7 +3,7 @@
 主な処理:
   - book_ir.build_ir() で IR ブロック列を構築し、印刷目次ページを既定で除外
   - 大見出しごとに XHTML を分割し、「部」「大見出し」「中見出し」の3階層 nav.xhtml を構築
-  - ｜親《ルビ》記法を <ruby><rt> へ変換
+  - ｜親《ルビ》記法を <ruby><rp><rt> へ変換し、半角2桁の数字などを縦中横（.tcy）で立てる
   - 表セル構造を <table>（rowspan/colspan 付き）へ、図版を crop_figures で切り出して <img> へ
   - PDF 1ページ目をカバー画像としてレンダリング
   - 生成した EPUB を zip 構造・XML 整形式・manifest/spine 突合の観点で自己検証する
@@ -31,18 +31,52 @@ _KANJI_CLASS = KANJI_RE.pattern.strip("[]")
 RUBY_PIPE_RE = re.compile(r"｜([^｜《》]+)《([^《》]+)》")
 RUBY_BARE_RE = re.compile(f"([{_KANJI_CLASS}]+)《([^《》]+)》")
 
+# 縦中横の対象。normalize_text() の NFKC 正規化で全角数字はすべて半角になるため
+# （'第１２章' → '第12章'）、縦書きではそのままだと数字が横倒しになる。
+#   - 半角数字ちょうど2桁だけを対象にする。1桁は回転しないので不要、3桁以上は
+#     1文字幅に潰れて判読不能になるため絶対に含めない（4桁の年号 1980 も対象外）
+#   - 「!!」「!?」「?!」「??」の2字連続は慣習的に縦中横にする
+TCY_RE = re.compile(r"(?<![0-9A-Za-z])([0-9]{2})(?![0-9A-Za-z])|(?<![!?])([!?]{2})(?![!?])")
+# 縦中横を適用してはいけない範囲（タグそのものと、ルビ要素の中身）を退避するための分割。
+# 属性値にマッチすると <img src="../images/fig02.png"/> のようなパスが壊れる。
+SKIP_RE = re.compile(r"(<ruby>.*?</ruby>|<[^>]+>)", re.S)
+
+
+def add_tcy(html: str) -> str:
+    """レンダリング済み HTML 断片のテキストノードだけに <span class="tcy"> を付ける。
+
+    SKIP_RE で分割すると奇数 index が退避対象（タグ・ルビ要素まるごと）、
+    偶数 index がテキストノードになる。ルビは <rt> の中も含めて丸ごと退避される。
+    """
+
+    parts = SKIP_RE.split(html)
+    for i in range(0, len(parts), 2):
+        parts[i] = TCY_RE.sub(lambda m: f'<span class="tcy">{m.group(0)}</span>', parts[i])
+    return "".join(parts)
+
 
 def render_inline(text: str) -> str:
     """本文中の｜親《ルビ》記法を <ruby><rt> タグへ変換する（エスケープ込み）。
 
     エスケープはここで一度だけ行う。｜《》は XML エスケープの対象外の文字なので、
     エスケープ後にルビ変換を行っても二重エスケープや取りこぼしは起きない。
+
+    <rp> はルビ非対応のリーダー向けのフォールバック。挿入するのは（）であって
+    《》ではないので、後続の RUBY_BARE_RE に再マッチして二重変換されることはない。
+    なお rp { display: none } は書かない（UA スタイルシートで既に非表示であり、
+    自前で書くと「CSS は解釈するがルビ非対応」なリーダーで括弧まで消えてしまう）。
+
+    縦中横は最後に適用する。ルビ変換より前にかけると [漢字]+《》 の隣接が span で
+    分断されて RUBY_BARE_RE が壊れる。
     """
 
+    def ruby(m: re.Match) -> str:
+        return f"<ruby>{m.group(1)}<rp>（</rp><rt>{m.group(2)}</rt><rp>）</rp></ruby>"
+
     escaped = escape(text)
-    escaped = RUBY_PIPE_RE.sub(lambda m: f"<ruby>{m.group(1)}<rt>{m.group(2)}</rt></ruby>", escaped)
-    escaped = RUBY_BARE_RE.sub(lambda m: f"<ruby>{m.group(1)}<rt>{m.group(2)}</rt></ruby>", escaped)
-    return escaped
+    escaped = RUBY_PIPE_RE.sub(ruby, escaped)
+    escaped = RUBY_BARE_RE.sub(ruby, escaped)
+    return add_tcy(escaped)
 
 
 def escape_attr(text: str) -> str:
@@ -375,7 +409,11 @@ def render_nav_list(nodes: list[dict]) -> str:
         return ""
     items = []
     for node in nodes:
-        inner = f'<a href="{escape_attr(node["href"])}">{escape(node["title"])}</a>'
+        # heading_title() は normalize_text() を通すだけで、normalize_text() は
+        # ｜《》を退避するためルビ記法が生のまま残る。nav の <a> の中には <ruby> を
+        # 置けるので、本文と同じ render_inline() でルビ化する。
+        # render_inline() が自前でエスケープするため escape() の二重適用はしない。
+        inner = f'<a href="{escape_attr(node["href"])}">{render_inline(node["title"])}</a>'
         children = render_nav_list(node["children"])
         items.append(f"<li>{inner}{children}</li>")
     return "<ol>" + "".join(items) + "</ol>"
@@ -455,6 +493,37 @@ def build_css(horizontal: bool) -> str:
     # しない。前後空きは本文の組方向に合わせた物理プロパティで直接指定する。
     block_gap = "1em 0" if horizontal else "0 1em"
 
+    # 縦中横は縦書きのときだけ意味を持つので、横書き時は規則ごと出さない。
+    # 宣言の順序は電書協標準 CSS に合わせる。レガシー接頭辞は値が horizontal で
+    # 標準の text-combine-upright とは別語彙なので、標準版を後に置いて上書きさせる。
+    # 表・図版は縦書き本文の中でも horizontal-tb に戻しているため、その中の縦中横は
+    # かえって有害。無効化する規則も併せて出す。
+    tcy_rules = "" if horizontal else """.tcy {
+  -webkit-text-combine: horizontal;
+  -webkit-text-combine-upright: all;
+  text-combine-upright: all;
+  -epub-text-combine: horizontal;
+}
+table.h-table .tcy, figure.h-figure .tcy {
+  text-combine-upright: none;
+  -webkit-text-combine: none;
+  -epub-text-combine: none;
+}
+"""
+
+    # 禁則・ぶら下げ。html, body ではなく別規則として置く（self_check は
+    # html, body ブロックを丸ごと切り出して中の writing-mode を全部拾うので、
+    # 無関係な宣言を紛れ込ませない）。どちらの宣言も継承するので body で足りる。
+    #   - line-break: strict は CJK で最も厳しい行分割規則。小書き仮名（っゃゅょ）
+    #     と長音符「ー」の行頭禁則が効く
+    #   - hanging-punctuation: allow-end は句読点のぶら下げ。実質 WebKit のみだが
+    #     未対応エンジンは無視するだけ
+    # font-feature-settings の vert / vrt2 と text-orientation・text-spacing は
+    # 意図的に書かない。vert は UA が自動適用する義務があり冗長、vrt2 は W3C 仕様が
+    # "is not used by CSS" と排除しており UA の回転と二重にかかる恐れがある。
+    # text-orientation は初期値 mixed が日本語縦組みの正解、text-spacing の normal は
+    # 約物詰めを抑制する逆効果。
+
     return f"""html, body {{
   writing-mode: {mode};
   -epub-writing-mode: {mode};
@@ -462,6 +531,12 @@ def build_css(horizontal: bool) -> str:
   font-family: "Noto Serif CJK JP", serif;
   line-height: 1.9;
 }}
+body {{
+  line-break: strict;
+  hanging-punctuation: allow-end;
+}}
+{tcy_rules}ruby {{ ruby-position: over; -webkit-ruby-position: over; -epub-ruby-position: over; }}
+rt {{ font-size: 0.5em; line-height: 1; }}
 h1 {{ font-size: 1.6em; {block_margin("1.2em", "0.6em")} }}
 h2 {{ font-size: 1.3em; {block_margin("1em", "0.5em")} }}
 h3 {{ font-size: 1.1em; {block_margin("0.8em", "0.4em")} }}

@@ -42,15 +42,29 @@ spine の `page-progression-direction`）だけで、**縦書き側にも実バ�
 `name`/`content` 形式なので、そちらに変更した。値も Kindle の語彙（進行方向込みの4値）に
 合わせ、横書きは `horizontal-tb` ではなく `horizontal-lr`。
 
-### フェーズ2: 縦書きタイポグラフィ（着手中）
+### フェーズ2: 縦書きタイポグラフィ（完了）
 
 | # | 項目 | 状態 | 備考 |
 |---|---|---|---|
-| 2-1 | 縦中横 `text-combine-upright` | 🔜 未着手 | 最優先。下記参照 |
-| 2-2 | ルビの `<rp>` フォールバック | 🔜 未着手 | ruby 非対応リーダー対策 |
-| 2-3 | `ruby-position` の明示 | 🔜 未着手 | |
-| 2-4 | 欧文の `text-orientation` 制御 | 🔜 未着手 | 既定に任せる判断もあり得る |
-| 2-5 | 禁則・ぶら下げ | 🔜 未着手 | `line-break` / `hanging-punctuation` |
+| 2-1 | 縦中横 `text-combine-upright` | ✅ done | 最優先。下記参照 |
+| 2-2 | ルビの `<rp>` フォールバック | ✅ done | ruby 非対応リーダー対策 |
+| 2-3 | `ruby-position` の明示 | ✅ done | 初期値は `over` ではなく `alternate` |
+| 2-4 | 欧文の `text-orientation` 制御 | ✅ 指定しない判断 | 初期値 `mixed` が日本語縦組みの正解 |
+| 2-5 | 禁則・ぶら下げ | ✅ done | `line-break: strict` / `hanging-punctuation: allow-end` |
+| 2-6 | nav の目次にルビ記法が生で出るバグ修正 | ✅ done | 下記参照 |
+
+**書かない CSS を明示的に選んでいる。** `font-feature-settings` の `vert` は UA が
+自動適用する義務があるので冗長、`vrt2` は W3C 仕様が "is not used by CSS" と排除して
+おり UA の回転と二重にかかる恐れがある。`text-orientation` は初期値 `mixed` が正解、
+`text-spacing` の `normal` は約物詰めを抑制する逆効果。`rp { display: none }` も
+書かない（UA スタイルシートで既に非表示であり、自前で書くと「CSS は解釈するが
+ルビ非対応」なリーダーで括弧まで消え `漢字かんじ` という最悪の表示になる）。
+
+**2-6 は既存バグ。** `heading_title()` は `normalize_text()` を通すだけだが、
+`normalize_text()` は `｜《》` を保護するためルビ記法が残る。`render_nav_list()` は
+`escape()` するだけだったので、目次に `｜天体《てんたい》` が生のまま表示されていた。
+nav.xhtml の `<a>` 内には `<ruby>` を置けるので `render_inline()` を通すよう変更した
+（epubcheck 実測済み）。
 
 ### フェーズ3: リーダー互換性（未着手）
 
@@ -73,6 +87,15 @@ spine の `page-progression-direction`）だけで、**縦書き側にも実バ�
 縦書きの既定 `text-orientation: mixed` では半角数字は 90 度横倒しでレンダリングされる。
 つまり現在のパイプラインは、元が全角だった数字までわざわざ横倒しになる形に変換している。
 章番号・年号・ページ番号は書籍に頻出するため、縦書き出力で最も目につく不具合。
+
+対象は**半角数字ちょうど2桁**と `!!` `!?` `?!` `??` のみ。1桁は回転しないので不要、
+3桁以上は 1 文字幅に潰れて判読不能になるため 4 桁の年号（`1980`）も含めて対象外。
+仕様の `text-combine-upright: digits <n>` はどのブラウザも未実装なので使えず、
+`<span class="tcy">` で囲む方式のみ。適用は `render_inline()` の最後（ルビ変換より
+前にかけると `[漢字]+《》` の隣接が span で分断され `RUBY_BARE_RE` が壊れる）。
+タグとルビ要素は `SKIP_RE` で退避してから置換する。これを怠ると
+`<img src="../images/fig02.png"/>` が `fig<span class="tcy">02</span>.png` になり
+画像パスが壊れる。
 
 ---
 
