@@ -224,7 +224,8 @@ def resolve_offset(
         if needle in text:
             print(
                 f"ページオフセット自動推定: {offset}"
-                f"（書籍ページ {target['page_num']} → PDF p{pdf_page}、「{target['title']}」で照合）"
+                f"（書籍ページ {target['page_num']} → PDF p{pdf_page}、「{target['title']}」で照合）",
+                flush=True,
             )
             return offset
 
@@ -360,20 +361,20 @@ def run(args):
     n_pages = len(pdf_doc)
     analyzer_holder = [None]
 
-    print(f"PDF: {pdf_path.name} ({n_pages} ページ)")
+    print(f"PDF: {pdf_path.name} ({n_pages} ページ)", flush=True)
 
     # 1. 目次 OCR（既存 JSON があればスキップ）
     toc_pages = sorted(parse_pages(args.toc_pages))
     for p in toc_pages:
         ensure_page_ocr(pdf_doc, json_dir, p, args.dpi, args.device, analyzer_holder)
-    print(f"目次 OCR: p{toc_pages[0]}〜p{toc_pages[-1]}（{len(toc_pages)} ページ）確認済み")
+    print(f"目次 OCR: p{toc_pages[0]}〜p{toc_pages[-1]}（{len(toc_pages)} ページ）確認済み", flush=True)
 
     # 2. 目次パース
     entries = extract_toc_entries(json_dir, args.toc_pages)
-    print(f"\n目次エントリ: {len(entries)} 件")
+    print(f"\n目次エントリ: {len(entries)} 件", flush=True)
     for e in entries:
         tag = "roman" if e["is_roman"] else "arabic"
-        print(f"  [{e['level']}] {e['title']!r} page={e['page_num']}({tag})")
+        print(f"  [{e['level']}] {e['title']!r} page={e['page_num']}({tag})", flush=True)
 
     # 3. ページオフセット
     offset = resolve_offset(
@@ -383,12 +384,12 @@ def run(args):
 
     # 4. 章境界確定
     plan = build_chapter_plan(entries, offset, n_pages)
-    print(f"\n章境界: {len(plan)} 章（オフセット {offset}）")
+    print(f"\n章境界: {len(plan)} 章（オフセット {offset}）", flush=True)
     for i, c in enumerate(plan):
-        print(f"  [{i}][{c['level']}] {c['title']!r}: PDF p{c['start']}〜p{c['end']} ({c['end'] - c['start'] + 1} ページ)")
+        print(f"  [{i}][{c['level']}] {c['title']!r}: PDF p{c['start']}〜p{c['end']} ({c['end'] - c['start'] + 1} ページ)", flush=True)
 
     if args.dry_run:
-        print("\n--dry-run のため、本文 OCR・LLM 校正・EPUB 生成はスキップしました。")
+        print("\n--dry-run のため、本文 OCR・LLM 校正・EPUB 生成はスキップしました。", flush=True)
         return
 
     if shutil.which("claude") is None:
@@ -401,13 +402,13 @@ def run(args):
     # 5. 章単位パイプライン: OCR は逐次、校正は章ごとに ThreadPoolExecutor へ投入
     proofread_cache_root = Path(args.proofread_cache)
     fixes_all: list[dict] = []
-    print(f"\n章単位パイプライン開始（校正並列数 {args.proofread_workers}）")
+    print(f"\n章単位パイプライン開始（校正並列数 {args.proofread_workers}）", flush=True)
     pool = ThreadPoolExecutor(max_workers=args.proofread_workers)
     try:
         futures = []
         for i, c in enumerate(plan):
             n = c["end"] - c["start"] + 1
-            print(f"[章 {i + 1}/{len(plan)}] 「{c['title']}」 OCR {n} ページ...")
+            print(f"[章 {i + 1}/{len(plan)}] 「{c['title']}」 OCR {n} ページ...", flush=True)
             for k, pn in enumerate(range(c["start"], c["end"] + 1), 1):
                 ensure_page_ocr(pdf_doc, json_dir, pn, args.dpi, args.device, analyzer_holder)
                 print(f"  OCR {k}/{n} ページ完了", flush=True)
@@ -428,7 +429,7 @@ def run(args):
         for i, fut in enumerate(futures):
             fixes = fut.result()
             fixes_all.extend(fixes)
-            print(f"[章 {i + 1}/{len(plan)}] 校正 done（{len(fixes)} 件）")
+            print(f"[章 {i + 1}/{len(plan)}] 校正 done（{len(fixes)} 件）", flush=True)
     except KeyboardInterrupt:
         # 実行中の claude -p サブプロセス自体を即座に kill するところまでは行わないが、
         # 少なくとも「新規チャンクの投入」は止め、待機中の future はキャンセルする
@@ -441,7 +442,7 @@ def run(args):
     fixes_path = Path(args.fixes_output)
     fixes_path.parent.mkdir(parents=True, exist_ok=True)
     fixes_path.write_text(json.dumps(fixes_all, ensure_ascii=False, indent=2), encoding="utf-8")
-    print(f"\n校正 fixes: {fixes_path}（{len(fixes_all)} 件）")
+    print(f"\n校正 fixes: {fixes_path}（{len(fixes_all)} 件）", flush=True)
 
     # 6. EPUB 生成
     to_epub.build_epub(
