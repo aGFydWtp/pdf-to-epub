@@ -12,6 +12,7 @@
 | `to_epub.py` | IR → EPUB3（縦書き・nav.xhtml 階層目次＋EPUB2 互換 toc.ncx・ruby/table/img・self-check 内蔵） |
 | `to_aozora.py` | IR → 青空文庫形式テキスト（任意出力） |
 | `llm_proofread.py` | `claude -p` による OCR 誤認識の校正（チャンク並列・キャッシュ・検証付き適用） |
+| `book_meta.py` | 書誌 API（openBD / 国立国会図書館サーチ）から書名・著者・出版社を取得（API キー不要） |
 | `pdf_to_epub.py` | 目次先行 OCR → 章境界確定 → 章ごとに OCR+校正を並列 → EPUB 生成のオーケストレーター |
 
 ## 使い方
@@ -27,15 +28,25 @@ uv run --project "$PIPE" python "$PIPE/pdf_to_epub.py" -p "BOOK.pdf" \
 
 # 2. 本実行（LLM 校正に claude CLI の課金が発生）
 uv run --project "$PIPE" python "$PIPE/pdf_to_epub.py" -p "BOOK.pdf" \
-  --toc-pages 2-3 --page-offset 12 --title "書名" --author "著者" -o "書名.epub"
+  --toc-pages 2-3 --page-offset 12 --isbn "4-06-149293-4" -o "書名.epub"
 
 # 3. 検証
 epubcheck "書名.epub"
 ```
 
+書誌は ISBN から引ける。ISBN が分からないときは書名で候補を検索する（同名異書があるので選ぶのは人間）。
+
+```bash
+uv run --project "$PIPE" python "$PIPE/book_meta.py" --isbn "4-06-149293-4"
+uv run --project "$PIPE" python "$PIPE/book_meta.py" --title "時間を哲学する"
+```
+
 ### 主なオプション
 
-- `--title` / `--author` / `--publisher`: 書誌情報。`--title` は `--dry-run` 以外で必須
+- `--isbn`: 書誌 API から書名・著者・出版社を補完する（10 桁・13 桁、ハイフン有無どちらでも可）。
+  見つからない場合は警告だけ出して `--title` などの指定値にフォールバックする
+- `--title` / `--author` / `--publisher`: 書誌情報。API より常に優先される。
+  `--title` は `--dry-run` 以外で必須（`--isbn` で取得できた場合を除く）
 - `--toc-pages` / `--page-offset`: 印刷目次のページ範囲と、書籍ページ番号→PDF ページ番号の補正
 - `--horizontal`: 横書き（`horizontal-tb`）で出力する。既定は縦書き（`vertical-rl`）。
   縦書きでは spine に `page-progression-direction="rtl"` が付き、

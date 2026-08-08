@@ -24,6 +24,7 @@ import tempfile
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+import book_meta
 import ocr_book
 import to_aozora
 import to_epub
@@ -474,6 +475,42 @@ def run(args):
         )
 
 
+def resolve_book_meta(args) -> None:
+    """--isbn が指定されていれば書誌 API を引き、未指定のメタデータを補完する。
+
+    引数で明示された値は常に API より優先する（API は空欄を埋めるだけ）。
+    書誌が見つからない場合やネットワークが不通の場合は警告を出すだけで進み、
+    従来どおり --title / --author / --publisher の指定値を使う。
+
+    OCR を始める前に呼ぶこと。失敗を数時間の処理のあとで知ることになると困る。
+    """
+
+    if not args.isbn:
+        return
+
+    print(f"書誌 API を検索します（ISBN {args.isbn}）...", flush=True)
+    meta = book_meta.lookup_isbn(args.isbn)
+    if meta is None:
+        print("  書誌が見つかりませんでした。--title / --author / --publisher の指定値を使います。", flush=True)
+        return
+
+    print(f"  取得元: {meta.source}", flush=True)
+    for line in meta.summary_lines():
+        print(f"    {line}", flush=True)
+
+    filled = []
+    if not args.title and meta.title:
+        args.title = meta.title
+        filled.append("--title")
+    if not args.author and meta.author:
+        args.author = meta.author
+        filled.append("--author")
+    if not args.publisher and meta.publisher:
+        args.publisher = meta.publisher
+        filled.append("--publisher")
+    print(f"  書誌から補完: {', '.join(filled) if filled else 'なし（すべて引数で指定済み）'}", flush=True)
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="目次を先に OCR して章境界を確定し、章ごとに OCR と LLM 校正を"
@@ -482,9 +519,14 @@ def main():
     parser.add_argument("-p", "--pdf", required=True, help="入力 PDF")
     parser.add_argument("-j", "--json-dir", default="ocr_json", help="OCR JSON の保存/参照先")
     parser.add_argument("-o", "--output", default=None, help="出力 EPUB ファイル（--dry-run 時は不要）")
-    parser.add_argument("--title", default=None, help="書名（--dry-run 時は不要）")
+    parser.add_argument("--title", default=None, help="書名（--dry-run 時、または --isbn 指定時は不要）")
     parser.add_argument("--author", default="", help="著者")
     parser.add_argument("--publisher", default="", help="出版社")
+    parser.add_argument(
+        "--isbn", default=None,
+        help="ISBN。書誌 API（openBD / 国立国会図書館サーチ）から書名・著者・出版社を補完する。"
+             "取得できなかった項目と、明示指定した引数は従来どおりの手動指定が優先される",
+    )
     parser.add_argument("--horizontal", action="store_true", help="横書きで出力する（既定は縦書き）")
 
     parser.add_argument("--toc-pages", required=True, help="目次のページ範囲（例: 2-3）")
@@ -514,8 +556,17 @@ def main():
     )
     args = parser.parse_args()
 
-    if not args.dry_run and (not args.output or not args.title):
-        parser.error("--dry-run を指定しない場合は --output と --title が必須です")
+    if not args.dry_run and not args.output:
+        parser.error("--dry-run を指定しない場合は --output が必須です")
+
+    # 書誌の解決は OCR より前。--dry-run でも実行して、EPUB に入る書誌を人が確認できるようにする。
+    resolve_book_meta(args)
+
+    if not args.dry_run and not args.title:
+        parser.error(
+            "--dry-run を指定しない場合は --title が必須です"
+            "（--isbn を指定しても書誌を取得できなかった場合は --title を明示してください）"
+        )
 
     run(args)
 
