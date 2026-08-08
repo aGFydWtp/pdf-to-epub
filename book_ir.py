@@ -355,6 +355,42 @@ def fix_subtitle_dash(lines: list[str]) -> list[str]:
     return lines
 
 
+CHAPTER_NUM_TOKEN_RE = re.compile(r"^(第|章|\d{1,2})$")
+CHAPTER_HEAD_RE = re.compile(r"^第\d{1,2}章$")
+SPECIAL_CHAPTER_RE = re.compile(r"^[序終]章$")
+
+
+def chapter_title_page(page_lines: list[dict]) -> list[str] | None:
+    """章扉ページなら ["第○章", "章題"] を返す。章扉でなければ None を返す。
+
+    章扉では「第」「1」「章」が独立した要素として横に並び、章題は縦組みで
+    折り返されるため、OCR の読み順のままでは「1第章」「Rev0ps価値収益拡大を…」の
+    ように崩れて heading_level() の「^第○章」に当たらない。番号は x 昇順
+    （左→右）、章題は x 降順（右→左）で組み直す。
+
+    「第○章」が柱（page_header）と判定されて捨てられる版面もあるため、
+    要素のロールではなくページ全体の行から判定する。
+    """
+
+    nums: list[dict] = []
+    titles: list[dict] = []
+    for line in page_lines:
+        text = normalize_text(line["text"]).replace(" ", "")
+        if not text:
+            continue
+        bucket = nums if (CHAPTER_NUM_TOKEN_RE.match(text) or SPECIAL_CHAPTER_RE.match(text)) else titles
+        bucket.append({"x": line["x0"], "text": text})
+
+    if not nums:
+        return None
+    head = "".join(t["text"] for t in sorted(nums, key=lambda t: t["x"]))
+    if not (CHAPTER_HEAD_RE.match(head) or SPECIAL_CHAPTER_RE.match(head)):
+        return None
+
+    title = "".join(t["text"] for t in sorted(titles, key=lambda t: -t["x"]))
+    return [head, title] if title else [head]
+
+
 def heading_level(text: str) -> str:
     head = text.split("\n")[0].strip()
     if re.match(r"^第\s*[ⅠⅡⅢⅣⅤ]\s*部", head):
@@ -541,6 +577,16 @@ def build_ir(
                 if text:
                     blocks.append({"kind": "raw", "text": text, "page": page_no})
             continue
+
+        # --- 章扉ページ（短いテキストだけで「第○章」「序章」からなる）---
+        if len(page_text) < 120 and not data["tables"]:
+            chapter_head = chapter_title_page(page_lines)
+            if chapter_head:
+                flush()
+                blocks.append(
+                    {"kind": "heading", "level": "大", "lines": chapter_head, "page": page_no}
+                )
+                continue
 
         consumed: list[bool] = [False] * len(page_lines)
         fig_index = 0
