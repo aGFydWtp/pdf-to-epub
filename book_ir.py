@@ -195,16 +195,17 @@ KANJI_RE = re.compile(r"[一-鿿々〆ヵヶ]")
 TRIM_EDGE = "「」『』（）()〈〉《》、。，．・:：/／ 　"
 
 
-def base_span(text: str, x0: float, x1: float, rx0: float, rx1: float, ruby: str):
+def base_span(text: str, t0: float, t1: float, r0: float, r1: float, ruby: str):
     """ルビの矩形が覆う親文字の範囲 [start, end) を求める。
 
-    行の矩形を各文字の字幅（和文は全角、欧文・数字は半角）で按分し、
-    ルビと 60% 以上重なる文字を親文字とみなす。
+    座標は行の長さ方向（横組みは x、縦組みは y）へ射影した 1 次元で与える。
+    t0/t1 が親文字行、r0/r1 がルビ行の範囲。行の矩形を各文字の字送り（和文は全角、
+    欧文・数字は半角）で按分し、ルビと 60% 以上重なる文字を親文字とみなす。
     """
 
     widths = [1.0 if unicodedata.east_asian_width(c) in "WFA" else 0.5 for c in text]
-    scale = (x1 - x0) / (sum(widths) or 1.0)
-    bounds, acc = [], x0
+    scale = (t1 - t0) / (sum(widths) or 1.0)
+    bounds, acc = [], t0
     for w in widths:
         bounds.append((acc, acc + w * scale))
         acc += w * scale
@@ -212,10 +213,10 @@ def base_span(text: str, x0: float, x1: float, rx0: float, rx1: float, ruby: str
     covered = [
         k
         for k, (a, b) in enumerate(bounds)
-        if (min(rx1, b) - max(rx0, a)) > (b - a) * 0.6
+        if (min(r1, b) - max(r0, a)) > (b - a) * 0.6
     ]
     if not covered:
-        mid = (rx0 + rx1) / 2
+        mid = (r0 + r1) / 2
         covered = [
             min(range(len(bounds)), key=lambda k: abs(sum(bounds[k]) / 2 - mid))
         ]
@@ -236,53 +237,88 @@ def base_span(text: str, x0: float, x1: float, rx0: float, rx1: float, ruby: str
 
 
 def attach_ruby(lines: list[dict]) -> list[dict]:
-    """本文より小さい仮名行をルビとみなし、直下の親文字へ《》で結合する。
+    """本文より小さい仮名行をルビとみなし、隣の親文字へ《》で結合する。
 
-    ルビが親文字の上に載る横組みだけを対象にする。縦組みのルビは行の右側に付くので
-    この幾何では拾えないうえ、縦組みページで行の高さ（＝行の長さ）の中央値を取ると
-    横組みの行がもれなくルビ候補になり、仮名だけのキャプションを本文へ飲み込む。
+    ルビは横組みなら親文字の上、縦組みなら親文字の右に付く。字の大きさは組方向と
+    直交する辺（横組みは高さ、縦組みは幅）に出るので、本文との大小はその辺で見分け、
+    親文字のどこに掛かるかは行の長さ方向（横組みは x、縦組みは y）の重なりで決める。
+
+    1 ページに両方の組方向が混在する版面があるため、中央値も親文字探しも組方向ごとに
+    閉じて行う。縦組みページで行の高さ（＝行の長さ）の中央値を取ると、横組みの行が
+    もれなくルビ候補になり、仮名だけのキャプションを本文へ飲み込む。
+
+    1 語のルビが OCR で複数の行に割れることがあるので、同じ親文字行に掛かる断片は
+    行の長さ方向で近接するものをまとめてから 1 つのルビとして付ける。
     """
 
-    horizontal = [i for i, l in enumerate(lines) if not l["vertical"]]
-    if len(horizontal) < 3:
-        return lines
-    med = statistics.median(lines[i]["h"] for i in horizontal)
-    body = [i for i in horizontal if lines[i]["h"] >= med * 0.72]
     consumed: set[int] = set()
     # 親文字行ごとに (開始, 終了, ルビ) を集めてから、後ろ側から差し込む
     edits: dict[int, list[tuple[int, int, str]]] = {}
 
-    for i in horizontal:
-        r = lines[i]
-        if r["h"] >= med * 0.72:
+    for vertical in (False, True):
+        group = [i for i, l in enumerate(lines) if bool(l["vertical"]) == vertical]
+        if len(group) < 3:
             continue
-        text = r["text"].replace(" ", "").strip()
-        if not text or not RUBY_RE.fullmatch(text):
-            continue
+        size, t0, t1 = ("w", "y0", "y1") if vertical else ("h", "x0", "x1")
+        med = statistics.median(lines[i][size] for i in group)
+        body = [i for i in group if lines[i][size] >= med * 0.72]
+        # 親文字行ごとに、掛かるルビ行を (始点, 終点, 文字列, 行番号) で集める
+        found: dict[int, list[tuple[float, float, str, int]]] = {}
 
-        base_idx = None
-        for j in body:
-            b = lines[j]
-            # 親文字行の矩形はルビと数 px 重なることがある
-            gap = b["y0"] - r["y1"]
-            if not (-med * 0.4 <= gap <= med * 0.9):
+        for i in group:
+            r = lines[i]
+            if r[size] >= med * 0.72:
                 continue
-            overlap = min(r["x1"], b["x1"]) - max(r["x0"], b["x0"])
-            if overlap < (r["x1"] - r["x0"]) * 0.5:
+            text = r["text"].replace(" ", "").strip()
+            if not text or not RUBY_RE.fullmatch(text):
                 continue
-            if base_idx is None or b["y0"] < lines[base_idx]["y0"]:
-                base_idx = j
-        if base_idx is None:
-            continue
 
-        b = lines[base_idx]
-        if not b["text"]:
-            continue
-        start, end = base_span(b["text"], b["x0"], b["x1"], r["x0"], r["x1"], text)
-        if not b["text"][start:end].strip():
-            continue
-        edits.setdefault(base_idx, []).append((start, end, text))
-        consumed.add(i)
+            base_idx = None
+            for j in body:
+                b = lines[j]
+                # 親文字行の矩形はルビと数 px 重なることがある
+                gap = r["x0"] - b["x1"] if vertical else b["y0"] - r["y1"]
+                if not (-med * 0.4 <= gap <= med * 0.9):
+                    continue
+                overlap = min(r[t1], b[t1]) - max(r[t0], b[t0])
+                if overlap < (r[t1] - r[t0]) * 0.5:
+                    continue
+                if base_idx is None:
+                    base_idx = j
+                    continue
+                # ルビに最も近い行を親文字とする（縦組みは左隣＝x1 が大きい方）
+                prev = lines[base_idx]
+                nearer = b["x1"] > prev["x1"] if vertical else b["y0"] < prev["y0"]
+                if nearer:
+                    base_idx = j
+            if base_idx is None:
+                continue
+
+            if not lines[base_idx]["text"]:
+                continue
+            found.setdefault(base_idx, []).append((r[t0], r[t1], text, i))
+
+        # 1 語のルビが複数の行に割れて出ることがある（引き伸ばして掛かるルビで顕著）。
+        # 行の長さ方向で近接する断片は 1 つのルビに戻し、断片全体を覆う範囲の親文字に付ける。
+        # 閾値 0.8med は実測から: 割れた断片の間隔は 0.61med（『時間を哲学する』p0089 の
+        # 「テロス」）、別語のルビ同士は間に親文字が入るので 1 文字＝1.0med 以上離れる。
+        for base_idx, frags in found.items():
+            b = lines[base_idx]
+            runs: list[list[tuple[float, float, str, int]]] = []
+            for f in sorted(frags):
+                if runs and f[0] - max(g[1] for g in runs[-1]) <= med * 0.8:
+                    runs[-1].append(f)
+                else:
+                    runs.append([f])
+
+            for run in runs:
+                r0, r1 = min(f[0] for f in run), max(f[1] for f in run)
+                ruby = "".join(f[2] for f in run)
+                start, end = base_span(b["text"], b[t0], b[t1], r0, r1, ruby)
+                if not b["text"][start:end].strip():
+                    continue
+                edits.setdefault(base_idx, []).append((start, end, ruby))
+                consumed.update(f[3] for f in run)
 
     for idx, spans in edits.items():
         s = lines[idx]["text"]

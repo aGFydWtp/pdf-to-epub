@@ -193,3 +193,64 @@ def test_縦組みページの横組み行をルビとして飲み込まない()
     caption = hword(100, 60, "みだし")  # 仮名だけの横組み行
     lines = build_lines([*body, caption])
     assert "みだし" in [l["text"] for l in attach_ruby(lines)]
+
+
+# 『時間を哲学する』p0089 の実測値。「目的/終局」に引き伸ばして掛かる「テロス」の
+# ルビが 'デ'（x=223-245）と 'ロ ス'（x=264-332）の 2 行に割れて出る。本文の行高は 31px。
+SPLIT_BASE = "うちにすでに目的/終局を含む活動(例:見る)である。哲学者アンソ"
+SPLIT_RESULT = "うちにすでに｜目的/終局《デロス》を含む活動(例:見る)である。哲学者アンソ"
+
+
+MIRROR = 1000  # 縦組みの s 軸を反転するときの原点
+
+
+def box_word(t0: int, t1: int, s0: int, s1: int, text: str, vertical: bool = False) -> dict:
+    """実測の矩形から 1 行を作る。
+
+    t は行の長さ方向（横組みは x、縦組みは y）、s は字の大きさの方向で、s が小さいほど
+    ルビ側にあたる。横組みのルビは親文字の上（y が小）、縦組みのルビは親文字の右
+    （x が大）に付くので、縦組みでは s 軸を反転して同じ実測値をそのまま使う。
+    """
+
+    x0, x1, y0, y1 = (MIRROR - s1, MIRROR - s0, t0, t1) if vertical else (t0, t1, s0, s1)
+    return {
+        "points": [[x0, y0], [x1, y0], [x1, y1], [x0, y1]],
+        "content": text,
+        "direction": "vertical" if vertical else "horizontal",
+    }
+
+
+@pytest.mark.parametrize("vertical", [False, True])
+def test_複数の行に割れたルビが_1_つに戻る(vertical):
+    """1 語のルビが 2 行に割れても、連結して断片全体が覆う親文字に付く"""
+
+    words = [
+        box_word(54, 867, 539, 570, SPLIT_BASE, vertical),
+        box_word(223, 245, 529, 544, "デ", vertical),
+        box_word(264, 332, 526, 546, "ロ ス", vertical),
+        # 字の大きさの中央値を版面どおり 31px に保つ本文行
+        *[
+            box_word(54, 867, 400 + i * 40, 431 + i * 40, f"{i}行目のほんぶん。", vertical)
+            for i in range(3)
+        ],
+    ]
+    (line,) = [l for l in attach_ruby(build_lines(words)) if "《" in l["text"]]
+    assert line["text"] == SPLIT_RESULT
+
+
+@pytest.mark.parametrize("vertical", [False, True])
+def test_離れた別語のルビは統合しない(vertical):
+    """同じ親文字行に付いても、親文字を挟んで離れたルビは別の語のまま残す"""
+
+    words = [
+        # 15 字を t=54..674 に置くので 1 字 41px。「時間」は 54..137、「空間」は 178..261
+        box_word(54, 674, 539, 570, "時間と空間はべつのものである。", vertical),
+        box_word(56, 134, 529, 544, "じかん", vertical),
+        box_word(180, 258, 529, 544, "くうかん", vertical),
+        *[
+            box_word(54, 674, 400 + i * 40, 431 + i * 40, f"{i}行目のほんぶん。", vertical)
+            for i in range(3)
+        ],
+    ]
+    (line,) = [l for l in attach_ruby(build_lines(words)) if "《" in l["text"]]
+    assert line["text"] == "｜時間《じかん》と｜空間《くうかん》はべつのものである。"
