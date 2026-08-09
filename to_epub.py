@@ -4,7 +4,7 @@
   - book_ir.build_ir() で IR ブロック列を構築し、印刷目次ページを既定で除外
   - 大見出しごとに XHTML を分割し、「部」「大見出し」「中見出し」の3階層 nav.xhtml を構築
   - 同じ目次ツリーから EPUB2 互換リーダー向けの toc.ncx を併載する
-  - ｜親《ルビ》記法を <ruby><rp><rt> へ変換し、半角2桁の数字などを縦中横（.tcy）で立てる
+  - ｜親《ルビ》記法を <ruby><rp><rt> へ変換し、縦組みでは数字・略語を全角化／縦中横で立てる
   - 表セル構造を <table>（rowspan/colspan 付き）へ、図版を crop_figures で切り出して <img> へ
   - PDF 1ページ目をカバー画像としてレンダリング
   - 生成した EPUB を zip 構造・XML 整形式・manifest/spine 突合の観点で自己検証する
@@ -43,40 +43,74 @@ _KANJI_CLASS = KANJI_RE.pattern.strip("[]")
 RUBY_PIPE_RE = re.compile(r"｜([^｜《》]+)《([^《》]+)》")
 RUBY_BARE_RE = re.compile(f"([{_KANJI_CLASS}]+)《([^《》]+)》")
 
-# 縦中横の対象。normalize_text() の NFKC 正規化で全角数字はすべて半角になるため
-# （'第１２章' → '第12章'）、縦書きではそのままだと数字が横倒しになる。
-#   - 半角数字ちょうど2桁だけを対象にする。1桁は回転しないので不要、3桁以上は
-#     1文字幅に潰れて判読不能になるため絶対に含めない（4桁の年号 1980 も対象外）
-#   - 「!!」「!?」「?!」「??」の2字連続は慣習的に縦中横にする。ただし book_ir の
-#     PUNCT_MAP が ! ? を全角化するため、実際に render_inline() へ届くのは「！？」
-#     の形。全角も対象に含めないとこの分岐は一度も発動しない。span の中身は
-#     半角に戻す（全角2字を1文字幅に組むと潰れて読めない）
-TCY_RE = re.compile(
-    r"(?<![0-9A-Za-z])([0-9]{2})(?![0-9A-Za-z])|(?<![!?！？])([!?！？]{2})(?![!?！？])"
+# 縦組みで数字・英字を正立させるための変換。normalize_text() の NFKC 正規化で
+# 全角数字・全角英字はすべて半角になるため（'第１２章' → '第12章'、'ＳＮＳ' → 'SNS'）、
+# 縦組みの既定 text-orientation: mixed ではそのまま 90 度横倒しでレンダリングされる。
+# 規則は原書2冊の版面を実測して確定したもの:
+#   - 数字1桁・3桁以上 …… 全角にして1字ずつ正立させる。『イスラム教の論理』p21
+#     「2011年」は ２/０/１/１ が縦に4字、p15「第2章216節」は ２/１/６ が縦に3字。
+#     「1桁は回転しないので不要」という当初の判断は実機で反証済み（1桁も横倒しになる）
+#   - 数字ちょうど2桁 …… 縦中横（1字分に詰める）。同 p20「コーラン第4章48節」の 48。
+#     span の中身は半角のまま入れる（全角を1字幅に組むと潰れる）
+#   - 小数点 …… 中黒。1字分を占めて中央に来る。同 p113「2.2人」は ２/・/２。
+#     『“町内会”は義務ですか?』の「27.8％」は 27(縦中横)・中黒・8(全角)・％(全角)
+#   - 大文字だけの略語（2文字以上）…… 桁数によらず全角で1字ずつ正立。同 p11
+#     「SNS戦略」は S/N/S が縦に3字、p2「EUからの離脱」は E/U が縦に2字。
+#     2文字でも縦中横にはしない（数字の2桁とは規則が違う）
+#   - 小文字を含む欧文語 …… 横倒しのまま。同 p74「Telegram は」。変換しない
+#   - 「!!」「!?」「?!」「??」…… 縦中横。ただし book_ir の PUNCT_MAP が ! ? を
+#     全角化するため、実際に render_inline() へ届くのは「！？」の形。全角も対象に
+#     含めないとこの分岐は一度も発動しない。span の中身は半角に戻す
+#
+# トークンは1本の正規表現でまとめて取る。小数点だけを独立した regex で処理すると
+# （(?<=[0-9])\.(?=[0-9]) を単独で走らせると）'Web2.0' の点まで中黒になる。
+# 前後の lookaround が仕様案より広い（'.' を含む）のは、英数字が混在するトークンを
+# 部分的に変換しないため。'.' を外すと 'Web2.0' → 'Web2.０'、'1.5GB' → '１.5GB' と
+# 途中だけ全角になる（トークンの途中に切れ目が入る形で、丸ごと素通りより見苦しい）。
+# 単独の大文字1文字は対象外。実データでは OCR が語を割ったノイズ（'L GBT'、'PD F'）
+# しか無く、[A-Z]{2,} に絞って取りこぼしはない。
+UPRIGHT_RE = re.compile(
+    r"(?<![0-9A-Za-z.])(?:([0-9]+(?:\.[0-9]+)*)|([A-Z]{2,}))(?![0-9A-Za-z]|\.[0-9A-Za-z])"
+    r"|(?<![!?！？])([!?！？]{2})(?![!?！？])"
 )
 _TO_HALF_BANG = str.maketrans("！？", "!?")
-# 縦中横を適用してはいけない範囲（タグそのものと、ルビ要素の中身）を退避するための分割。
+_TO_FULLWIDTH = str.maketrans(
+    "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ",
+    "０１２３４５６７８９ＡＢＣＤＥＦＧＨＩＪＫＬＭＮＯＰＱＲＳＴＵＶＷＸＹＺ",
+)
+# 変換を適用してはいけない範囲（タグそのものと、ルビ要素の中身）を退避するための分割。
 # 属性値にマッチすると <img src="../images/fig02.png"/> のようなパスが壊れる。
 SKIP_RE = re.compile(r"(<ruby>.*?</ruby>|<[^>]+>)", re.S)
 
 
-def add_tcy(html: str) -> str:
-    """レンダリング済み HTML 断片のテキストノードだけに <span class="tcy"> を付ける。
+def apply_upright(html: str) -> str:
+    """レンダリング済み HTML 断片のテキストノードだけに縦組みの正立処理をかける。
 
     SKIP_RE で分割すると奇数 index が退避対象（タグ・ルビ要素まるごと）、
     偶数 index がテキストノードになる。ルビは <rt> の中も含めて丸ごと退避される。
+
+    数字トークンは '.' で分割し、各セグメントに桁数の規則（2桁なら縦中横、
+    それ以外は全角化）を適用して中黒で連結する。
     """
 
-    def wrap(m: re.Match) -> str:
-        return f'<span class="tcy">{m.group(0).translate(_TO_HALF_BANG)}</span>'
+    def convert(m: re.Match) -> str:
+        digits, upper, marks = m.group(1), m.group(2), m.group(3)
+        if marks:
+            return f'<span class="tcy">{marks.translate(_TO_HALF_BANG)}</span>'
+        if upper:
+            return upper.translate(_TO_FULLWIDTH)
+        return "・".join(
+            f'<span class="tcy">{seg}</span>' if len(seg) == 2 else seg.translate(_TO_FULLWIDTH)
+            for seg in digits.split(".")
+        )
 
     parts = SKIP_RE.split(html)
     for i in range(0, len(parts), 2):
-        parts[i] = TCY_RE.sub(wrap, parts[i])
+        parts[i] = UPRIGHT_RE.sub(convert, parts[i])
     return "".join(parts)
 
 
-def render_inline(text: str) -> str:
+def render_inline(text: str, *, vertical: bool = True) -> str:
     """本文中の｜親《ルビ》記法を <ruby><rt> タグへ変換する（エスケープ込み）。
 
     エスケープはここで一度だけ行う。｜《》は XML エスケープの対象外の文字なので、
@@ -87,8 +121,12 @@ def render_inline(text: str) -> str:
     なお rp { display: none } は書かない（UA スタイルシートで既に非表示であり、
     自前で書くと「CSS は解釈するがルビ非対応」なリーダーで括弧まで消えてしまう）。
 
-    縦中横は最後に適用する。ルビ変換より前にかけると [漢字]+《》 の隣接が span で
-    分断されて RUBY_BARE_RE が壊れる。
+    正立処理は縦組みのときだけ、かつ最後に適用する。
+      - vertical=False（--horizontal のビルド、および縦組み本文の中で
+        horizontal-tb に戻す表セル）では一切かけない。全角化は文字そのものを
+        変えてしまうので、CSS を出さないことでは無効化できない
+      - ルビ変換より前にかけると [漢字]+《》 の隣接が span や全角字で分断されて
+        RUBY_BARE_RE が壊れる
     """
 
     def ruby(m: re.Match) -> str:
@@ -97,7 +135,7 @@ def render_inline(text: str) -> str:
     escaped = escape(text)
     escaped = RUBY_PIPE_RE.sub(ruby, escaped)
     escaped = RUBY_BARE_RE.sub(ruby, escaped)
-    return add_tcy(escaped)
+    return apply_upright(escaped) if vertical else escaped
 
 
 def render_plain(text: str) -> str:
@@ -464,7 +502,7 @@ def describe_chapter_pages(chapter: dict) -> str:
 HEADING_TAG = {"大": "h1", "中": "h2", "小": "h3"}
 
 
-def render_heading(lines: list[str], level: str, hid: str | None) -> str:
+def render_heading(lines: list[str], level: str, hid: str | None, *, vertical: bool = True) -> str:
     parts = [normalize_text(l) for l in lines]
     parts = [p for p in parts if p]
     if not parts:
@@ -473,13 +511,21 @@ def render_heading(lines: list[str], level: str, hid: str | None) -> str:
     parts = fix_subtitle_dash(parts)
     tag = HEADING_TAG[level]
     attr = f' id="{hid}"' if hid else ""
-    out = [f"<{tag}{attr}>{render_inline(parts[0])}</{tag}>"]
+    out = [f"<{tag}{attr}>{render_inline(parts[0], vertical=vertical)}</{tag}>"]
     for extra in parts[1:]:
-        out.append(f'<p class="subtitle">{render_inline(extra)}</p>')
+        out.append(f'<p class="subtitle">{render_inline(extra, vertical=vertical)}</p>')
     return "\n".join(out)
 
 
 def render_table(block: dict) -> str:
+    """表を <table class="h-table"> へ組む。セルの正立処理は組方向によらず行わない。
+
+    表は縦組みの本にあっても build_css() が writing-mode: horizontal-tb に戻すので、
+    セルの中身は常に横組みで表示される。横組みでは全角化は不格好だし、小数点の中黒化
+    （'2.2' → '２・２'）は縦組み専用の約物で、横組みでは数値の意味を壊す。縦中横も
+    同じ理由で CSS 側が table.h-table .tcy で無効化している。
+    """
+
     grid: dict[tuple[int, int], dict] = {(c["row"], c["col"]): c for c in block["cells"]}
     covered: set[tuple[int, int]] = set()
     rows_html = []
@@ -503,7 +549,7 @@ def render_table(block: dict) -> str:
             if cs > 1:
                 attrs += f' colspan="{cs}"'
             text = join_lines(cell["contents"].split("\n")) if cell.get("contents") else ""
-            tds.append(f"<td{attrs}>{render_inline(normalize_text(text))}</td>")
+            tds.append(f"<td{attrs}>{render_inline(normalize_text(text), vertical=False)}</td>")
         rows_html.append("<tr>" + "".join(tds) + "</tr>")
     return '<table class="h-table">\n' + "\n".join(rows_html) + "\n</table>"
 
@@ -514,15 +560,15 @@ def render_figure(block: dict) -> str:
     return f'<figure class="h-figure"><img src="../images/{block["src"]}" alt="{alt}"/></figure>'
 
 
-def render_block(b: dict) -> str:
+def render_block(b: dict, *, vertical: bool = True) -> str:
     kind = b["kind"]
     if kind == "para":
         text = normalize_text(join_lines(b["lines"]))
-        return f"<p>{render_inline(text)}</p>" if text else ""
+        return f"<p>{render_inline(text, vertical=vertical)}</p>" if text else ""
     if kind == "raw":
-        return f"<p>{render_inline(b['text'])}</p>" if b["text"] else ""
+        return f"<p>{render_inline(b['text'], vertical=vertical)}</p>" if b["text"] else ""
     if kind == "heading":
-        return render_heading(b["lines"], b["level"], b.get("id"))
+        return render_heading(b["lines"], b["level"], b.get("id"), vertical=vertical)
     if kind == "table":
         return render_table(b)
     if kind == "figure":
@@ -543,8 +589,8 @@ def xhtml_page(title: str, body_inner: str, css_href: str, epub_type: str, lang:
     )
 
 
-def render_chapter_xhtml(chapter: dict) -> str:
-    body = "\n".join(filter(None, (render_block(b) for b in chapter["blocks"])))
+def render_chapter_xhtml(chapter: dict, *, vertical: bool = True) -> str:
+    body = "\n".join(filter(None, (render_block(b, vertical=vertical) for b in chapter["blocks"])))
     first = chapter["blocks"][0] if chapter["blocks"] else None
     title = heading_title(first["lines"]) if first and first["kind"] == "heading" else "本文"
     # <title> はマークアップを置けないので、ルビ記法は親文字だけ残して落とす
@@ -557,25 +603,31 @@ def render_chapter_xhtml(chapter: dict) -> str:
 # --------------------------------------------------------------------------
 
 
-def render_nav_list(nodes: list[dict]) -> str:
+def render_nav_list(nodes: list[dict], *, vertical: bool = True) -> str:
     if not nodes:
         return ""
     items = []
     for node in nodes:
         # heading_title() は normalize_text() を通すだけで、normalize_text() は
         # ｜《》を退避するためルビ記法が生のまま残る。nav の <a> の中には <ruby> を
-        # 置けるので、本文と同じ render_inline() でルビ化する。
+        # 置けるので、本文と同じ render_inline() でルビ化する。nav.xhtml は本文と同じ
+        # style.css を読むので組方向も本文と同じ。正立処理も本文に合わせる。
         # render_inline() が自前でエスケープするため escape() の二重適用はしない。
-        inner = f'<a href="{escape_attr(node["href"])}">{render_inline(node["title"])}</a>'
-        children = render_nav_list(node["children"])
+        inner = (
+            f'<a href="{escape_attr(node["href"])}">'
+            f"{render_inline(node['title'], vertical=vertical)}</a>"
+        )
+        children = render_nav_list(node["children"], vertical=vertical)
         items.append(f"<li>{inner}{children}</li>")
     return "<ol>" + "".join(items) + "</ol>"
 
 
-def render_nav_xhtml(nav_tree: list[dict], first_chapter_href: str | None) -> str:
+def render_nav_xhtml(
+    nav_tree: list[dict], first_chapter_href: str | None, *, vertical: bool = True
+) -> str:
     """nav.xhtml を組み立てる（toc は section で包まず nav 要素を body 直下に置く）"""
 
-    toc_list = render_nav_list(nav_tree)
+    toc_list = render_nav_list(nav_tree, vertical=vertical)
     if not toc_list:
         # EPUB3 の toc nav は最低 1 エントリを持つ <ol> が必要（空の <nav> は仕様違反）。
         # 章がまったく検出できなかった場合のフォールバックとして本文への1項目だけ出す。
@@ -1139,8 +1191,11 @@ def build_epub(
     spine_items.append({"idref": "cover-page"})
 
     # --- nav ---
+    # 数字・英字の正立処理は縦組みのときだけ通す（全角化は文字そのものを変えるので、
+    # 縦中横のように「CSS を出さない」ことでは横組みビルドから外せない）。
+    vertical = not horizontal
     first_href = f"text/{chapters[0]['file']}" if chapters else None
-    nav_html = render_nav_xhtml(nav_tree, first_href)
+    nav_html = render_nav_xhtml(nav_tree, first_href, vertical=vertical)
     files["OEBPS/nav.xhtml"] = nav_html.encode("utf-8")
     manifest_items.append({"id": "nav", "href": "nav.xhtml", "media_type": "application/xhtml+xml", "properties": "nav"})
     spine_items.append({"idref": "nav", "linear": "no"})
@@ -1166,7 +1221,7 @@ def build_epub(
 
     # --- 章 ---
     for idx, chapter in enumerate(chapters):
-        xhtml = render_chapter_xhtml(chapter)
+        xhtml = render_chapter_xhtml(chapter, vertical=vertical)
         files[f"OEBPS/text/{chapter['file']}"] = xhtml.encode("utf-8")
         item_id = f"ch{idx:03d}"
         manifest_items.append({"id": item_id, "href": f"text/{chapter['file']}", "media_type": "application/xhtml+xml"})

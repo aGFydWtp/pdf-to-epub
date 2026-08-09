@@ -1,4 +1,4 @@
-"""縦書きタイポグラフィ（縦中横・ルビ・禁則）と nav のルビ化の検証。
+"""縦書きタイポグラフィ（数字・英字の正立、ルビ、禁則）と nav のルビ化の検証。
 
 to_epub は import 時に yomitoku/torch を必要としない（pypdfium2 は関数内で遅延
 import）ため、OCR 環境なしで純粋関数レベルのテストが回る。
@@ -11,40 +11,72 @@ import pytest
 
 from book_ir import normalize_text
 from to_epub import (
-    add_tcy,
+    apply_upright,
     build_css,
     heading_title,
     render_chapter_xhtml,
     render_figure,
     render_inline,
     render_nav_list,
+    render_nav_xhtml,
     render_plain,
+    render_table,
     strip_ruby,
 )
 
 TCY_OPEN = '<span class="tcy">'
 
 
-# --- 縦中横 -------------------------------------------------------------
+# --- 縦組みの正立処理（全角化・縦中横） ---------------------------------
+#
+# 入力は必ず normalize_text() を通した文字列で書く。normalize_text() の NFKC 正規化で
+# 全角数字・全角英字はすべて半角になる（'第１２章' → '第12章'）ため、半角を直書きした
+# テストは製品で通らない経路を見ているだけになり回帰を検出できない
+# （感嘆符の分岐がデッドコードだった実績がある。docs/HANDOFF.md §2-1 参照）。
+# 期待値は原書2冊の版面の実測から来ている。
 
 
 @pytest.mark.parametrize(
-    ("text", "expected"),
+    ("src", "expected"),
     [
-        # 半角数字ちょうど2桁だけが対象
-        ("第12章", f"第{TCY_OPEN}12</span>章"),
-        # 1桁は回転しないので不要
-        ("第3章", "第3章"),
-        # 3桁以上は 1 文字幅に潰れて判読不能になるので絶対に対象にしない
-        ("全123頁", "全123頁"),
-        ("1980年", "1980年"),
-        # 欧字と地続きの数字は識別子・単位の一部なので対象外
-        ("a12b", "a12b"),
-        ("12a", "12a"),
+        # 数字ちょうど2桁だけが縦中横（『イスラム教の論理』p20「第4章48節」の 48）
+        ("第１２章", f"第{TCY_OPEN}12</span>章"),
+        ("コーラン第４章４８節", f"コーラン第４章{TCY_OPEN}48</span>節"),
+        # 1桁は全角にして正立させる。同 p20「第4章」の 4 は全角1字分を占める
+        ("第３章", "第３章"),
+        # 3桁以上も1字ずつ全角で正立。縦中横にすると1字幅に潰れて読めない
+        ("２１６節", "２１６節"),          # 同 p15「第2章216節」→ ２/１/６ が縦に3字
+        ("２０１１年", "２０１１年"),       # 同 p21「2011年」→ ２/０/１/１ が縦に4字
+        ("全１２３頁", "全１２３頁"),
+        # 小数点は中黒。1字分を占めて中央に来る（同 p113「2.2人」→ ２/・/２）
+        ("２.２人", "２・２人"),
+        # 『“町内会”は義務ですか?』の「27.8％」→ 27(縦中横)・中黒・8(全角)・％(全角)
+        ("２７.８％", f"{TCY_OPEN}27</span>・８％"),
+        # 大文字だけの略語は桁数によらず全角で1字ずつ。2文字でも縦中横にはしない
+        # （同 p11「SNS戦略」→ S/N/S が縦に3字、p2「EUからの離脱」→ E/U が縦に2字）
+        ("ＳＮＳ戦略", "ＳＮＳ戦略"),
+        ("ＥＵからの離脱", "ＥＵからの離脱"),
+        # 小文字を含む欧文語は横倒しのまま（同 p74「Telegram は」）
+        ("Ｔｅｌｅｇｒａｍ", "Telegram"),
+        # 単独の大文字1字は変換しない（実データでは OCR が語を割ったノイズしかない）
+        ("Ａ社", "A社"),
     ],
 )
-def test_tcy_targets_only_two_digit_runs(text, expected):
-    assert render_inline(text) == expected
+def test_upright_follows_measured_typesetting_rules(src, expected):
+    assert render_inline(normalize_text(src)) == expected
+
+
+@pytest.mark.parametrize("src", ["Web2.0", "1.5GB", "ＭＰ3", "iPhone", "a12b", "12a", "p.12"])
+def test_upright_leaves_mixed_alphanumeric_tokens_whole(src):
+    """英数字が混在するトークンは丸ごと素通りさせる
+
+    途中だけ全角になる（'Web2.0' → 'Web2.０'、'1.5GB' → '１.5GB'）ほうが、
+    丸ごと横倒しよりも見苦しい。小数点を独立した正規表現で処理すると 'Web2.0' の
+    点まで中黒になるため、数字トークンは1本の正規表現でまとめて取る。
+    """
+
+    normalized = normalize_text(src)
+    assert render_inline(normalized) == normalized
 
 
 @pytest.mark.parametrize("mark", ["!!", "!?", "?!", "??"])
@@ -52,11 +84,11 @@ def test_tcy_covers_two_char_exclamation_marks(mark):
     assert render_inline(f"なんと{mark}") == f"なんと{TCY_OPEN}{mark}</span>"
 
 
-def test_tcy_does_not_break_tag_attributes():
+def test_upright_does_not_break_tag_attributes():
     """素朴な置換だと <img src="...fig02.png"> のパスや alt が壊れる"""
 
     html = '<img src="../images/fig02.png" alt="図12"/>'
-    assert add_tcy(html) == html
+    assert apply_upright(html) == html
     assert render_figure({"src": "fig02.png", "alt": "図12"}) == (
         '<figure class="h-figure"><img src="../images/fig02.png" alt="図12"/></figure>'
     )
@@ -69,10 +101,12 @@ def test_tcy_does_not_break_tag_attributes():
         "X線《12》",
     ],
 )
-def test_tcy_skips_ruby_contents(text):
-    """ルビは親文字も <rt> も丸ごと退避されるので縦中横が入らない"""
+def test_upright_skips_ruby_contents(text):
+    """ルビは親文字も <rt> も丸ごと退避されるので、縦中横も全角化も入らない"""
 
-    assert TCY_OPEN not in render_inline(text)
+    out = render_inline(text)
+    assert TCY_OPEN not in out
+    assert "12" in out and "１２" not in out
 
 
 def test_tcy_applied_outside_ruby_only():
@@ -86,6 +120,81 @@ def test_tcy_applied_outside_ruby_only():
 
 def test_render_inline_still_escapes():
     assert render_inline('<&"') == "&lt;&amp;\""
+
+
+# --- 正立処理は縦組みのときだけ通す -------------------------------------
+#
+# 縦中横は「横書きでは CSS を出さない」ことで無効化できたが、全角化は文字そのものを
+# 変えてしまうので同じ手が使えない。縦組みフラグを render_inline() まで引数で
+# 貫通させ、経路の途中で落ちていないことを本文・nav の両方で押さえる。
+
+HORIZONTAL_CHAPTER = {
+    "blocks": [
+        {"kind": "heading", "level": "大", "lines": ["第１２章"], "page": 1},
+        {"kind": "para", "lines": ["２０１１年は２.２人、ＳＮＳと１字"], "page": 1},
+    ],
+    "section_type": "chapter",
+}
+
+
+def test_horizontal_chapter_gets_no_conversion():
+    """--horizontal のビルドでは全角化も縦中横も通さない（横書きで不格好なため）"""
+
+    html = render_chapter_xhtml(HORIZONTAL_CHAPTER, vertical=False)
+    assert "<h1>第12章</h1>" in html
+    assert "<p>2011年は2.2人、SNSと1字</p>" in html
+    assert "tcy" not in html
+
+
+def test_vertical_chapter_gets_conversion():
+    """同じ入力でも縦組みなら本文・見出しの両方に正立処理がかかる"""
+
+    html = render_chapter_xhtml(HORIZONTAL_CHAPTER, vertical=True)
+    assert f"<h1>第{TCY_OPEN}12</span>章</h1>" in html
+    assert "<p>２０１１年は２・２人、ＳＮＳと１字</p>" in html
+
+
+@pytest.mark.parametrize(
+    ("vertical", "expected"),
+    [(True, f"第{TCY_OPEN}12</span>章　２０１１年"), (False, "第12章　2011年")],
+)
+def test_nav_follows_the_build_direction(vertical, expected):
+    """nav.xhtml は本文と同じ style.css を読むので、組方向も正立処理も本文と揃える"""
+
+    title = heading_title(["第１２章", "２０１１年"])
+    assert title == "第12章　2011年"  # 前提: normalize_text 済みで半角のまま届く
+
+    html = render_nav_xhtml(
+        [{"title": title, "href": "text/ch000.xhtml", "children": []}],
+        "text/ch000.xhtml",
+        vertical=vertical,
+    )
+    assert f">{expected}</a>" in html
+    if not vertical:
+        assert "tcy" not in html
+    ET.fromstring(html)
+
+
+def test_table_cells_are_never_converted():
+    """表は縦組みの本でも horizontal-tb に戻すので、セルは横組みの規則に従う
+
+    中黒化は縦組み専用の約物で、横組みのセルに出ると数値の意味が壊れる。
+    縦中横も同じ理由で build_css() が table.h-table .tcy で無効化している。
+    """
+
+    html = render_table(
+        {
+            "n_row": 1,
+            "n_col": 2,
+            "cells": [
+                {"row": 1, "col": 1, "contents": "２.２人"},
+                {"row": 1, "col": 2, "contents": "第１２章"},
+            ],
+        }
+    )
+    assert "<td>2.2人</td>" in html
+    assert "<td>第12章</td>" in html
+    assert "tcy" not in html
 
 
 # --- ルビ ---------------------------------------------------------------
@@ -227,13 +336,17 @@ def test_tcy_fires_on_normalized_exclamations():
     assert "！？" not in html
 
 
-def test_tcy_fires_on_normalized_digits():
-    """全角数字は NFKC で半角化されるので、そのまま2桁の縦中横対象になる"""
+def test_upright_fires_on_normalized_digits():
+    """全角数字は NFKC で半角化されるので、そのまま正立処理の対象になる
+
+    半角のまま残すと縦組みで 90 度横倒しになる。2桁だけが縦中横で、
+    それ以外の桁数は全角へ戻して1字ずつ正立させる。
+    """
 
     html = render_inline(normalize_text("第１２章と１９８０年と３人"))
     assert '<span class="tcy">12</span>' in html
-    assert "1980" in html and '<span class="tcy">1980' not in html   # 4桁は対象外
-    assert '<span class="tcy">3' not in html                          # 1桁は対象外
+    assert "１９８０年" in html and "1980" not in html   # 4桁は全角で1字ずつ
+    assert "３人" in html and '<span class="tcy">3' not in html   # 1桁も全角で正立
 
 
 def test_single_exclamation_is_not_combined():
