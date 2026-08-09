@@ -363,6 +363,34 @@ def split_chapters_and_nav(blocks: list[dict]) -> tuple[list[dict], list[dict]]:
     return chapters, nav_tree
 
 
+def chapters_without_nav_entry(chapters: list[dict]) -> list[dict]:
+    """大見出しを持たない章（＝nav にも toc.ncx にも現れない章）を返す。
+
+    split_chapters_and_nav() は大見出しが立つ前に本文が来ると暗黙の章を作る。
+    献辞や中扉だけの章なら正当だが、見出しが柱として捨てられたせいで章が丸ごと
+    nav から消えているときも同じ形になり、静かに欠落する。
+    見分けは人にしかつかないので、self_check の失敗にはせず警告だけ出す。
+    """
+
+    orphans = []
+    for ch in chapters:
+        head = ch["blocks"][0] if ch["blocks"] else None
+        if head is not None and head["kind"] == "heading" and head["level"] == "大":
+            continue
+        orphans.append(ch)
+    return orphans
+
+
+def describe_chapter_pages(chapter: dict) -> str:
+    """章のページ範囲を「p2〜p9」の形で表す（ページを持つブロックが無ければ「?」）"""
+
+    pages = [b["page"] for b in chapter["blocks"] if b.get("page") is not None]
+    if not pages:
+        return "?"
+    lo, hi = min(pages), max(pages)
+    return f"p{lo}" if lo == hi else f"p{lo}〜p{hi}"
+
+
 # --------------------------------------------------------------------------
 # XHTML レンダリング
 # --------------------------------------------------------------------------
@@ -1002,6 +1030,15 @@ def build_epub(
         blocks = apply_fixes(blocks, fixes)
 
     chapters, nav_tree = split_chapters_and_nav(blocks)
+    orphans = chapters_without_nav_entry(chapters)
+    if orphans:
+        print(
+            f"警告: 大見出しを持たない章が {len(orphans)} 件あります（本文には出ますが nav・"
+            "toc.ncx には現れません）: "
+            + ", ".join(f"{c['file']}({describe_chapter_pages(c)})" for c in orphans)
+            + "\n  献辞や中扉だけの章なら正常です。本文のある章なら、見出しが柱として"
+            "除去されている可能性があります。"
+        )
     book_uuid = str(uuid.uuid4())
     book_id = f"urn:uuid:{book_uuid}"
     n_tables = sum(1 for b in blocks if b["kind"] == "table")
