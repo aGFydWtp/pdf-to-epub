@@ -107,6 +107,38 @@ def test_digits_after_a_latin_period_still_stand_upright(src, expected):
     assert render_inline(normalize_text(src)) == expected
 
 
+@pytest.mark.parametrize("dot", ["·", "‧"])  # OCR が出す中点。PUNCT_MAP がどちらも ・ にする
+@pytest.mark.parametrize(
+    ("proofread", "raw_template", "expected"),
+    [
+        ("4.8%", "4{dot}8%", "４・８％"),
+        # 2桁は縦中横のまま。中黒で切れても桁数の規則は同じ結果に落ちる
+        ("27.8%", "27{dot}8%", f"{TCY_OPEN}27</span>・８％"),
+        ("2.2人", "2{dot}2人", "２・２人"),
+    ],
+)
+def test_decimal_point_reaches_the_same_output_by_both_paths(proofread, raw_template, expected, dot):
+    """小数がレンダリングへ届く2経路が同値であることを固定する
+
+    LLM 校正は正規化前の生テキストを見ており、OCR が読んだ '4·8%' を「小数点を
+    ナカグロに誤認識」として '4.8%' に直す。そのため経路が2つある。
+      1. 校正が当たった場合 …… '4.8％' が届く。数字トークンを '.' で split し、
+         桁数規則を適用して '・' で join する
+      2. 校正が当たらなかった場合 …… '4·8%' のまま normalize_text() に入り、
+         PUNCT_MAP の '·' → '・' で '4・8％' が届く。中黒がトークンの区切りになり、
+         '4' と '8' が独立した1桁トークンとして各々全角化される
+    どちらも同じ出力に落ちなければ、校正キャッシュの当たり外れで版面が変わる。
+    このテストの主張は「キャッシュヒット状況によって出力が変わらない」こと。
+    """
+
+    raw = raw_template.format(dot=dot)
+    # 前提: レンダリングへ届く文字列そのものは経路によって違う
+    assert normalize_text(proofread) != normalize_text(raw)
+
+    assert render_inline(normalize_text(proofread)) == expected
+    assert render_inline(normalize_text(raw)) == expected
+
+
 @pytest.mark.parametrize("mark", ["!!", "!?", "?!", "??"])
 def test_tcy_covers_two_char_exclamation_marks(mark):
     assert render_inline(f"なんと{mark}") == f"なんと{TCY_OPEN}{mark}</span>"
