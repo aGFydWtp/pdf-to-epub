@@ -169,11 +169,26 @@ def build_lines(words: list[dict]) -> list[dict]:
                 "x0": min(xs), "x1": max(xs),
                 "y0": min(ys), "y1": max(ys),
                 "h": max(ys) - min(ys),
+                "w": max(xs) - min(xs),
+                "vertical": w.get("direction") == "vertical",
                 "text": w["content"],
             }
         )
     lines.sort(key=lambda d: (d["y0"], d["x0"]))
     return lines
+
+
+def reading_order(lines: list[dict], vertical: bool) -> list[dict]:
+    """行を組方向の読み順に並べ替える。
+
+    縦組みは右の行から左へ、横組みは上の行から下へ読む。build_lines() の既定順は
+    横組みの読み順なので、縦組みの要素はここで組み直す必要がある。1 ページに縦組みと
+    横組みが混在する版面があるため、並べ替えはページ単位ではなく要素単位で行う。
+    """
+
+    if vertical:
+        return sorted(lines, key=lambda d: (-d["x0"], d["y0"]))
+    return sorted(lines, key=lambda d: (d["y0"], d["x0"]))
 
 
 KANJI_RE = re.compile(r"[一-鿿々〆ヵヶ]")
@@ -221,17 +236,24 @@ def base_span(text: str, x0: float, x1: float, rx0: float, rx1: float, ruby: str
 
 
 def attach_ruby(lines: list[dict]) -> list[dict]:
-    """本文より小さい仮名行をルビとみなし、直下の親文字へ《》で結合する"""
+    """本文より小さい仮名行をルビとみなし、直下の親文字へ《》で結合する。
 
-    if len(lines) < 3:
+    ルビが親文字の上に載る横組みだけを対象にする。縦組みのルビは行の右側に付くので
+    この幾何では拾えないうえ、縦組みページで行の高さ（＝行の長さ）の中央値を取ると
+    横組みの行がもれなくルビ候補になり、仮名だけのキャプションを本文へ飲み込む。
+    """
+
+    horizontal = [i for i, l in enumerate(lines) if not l["vertical"]]
+    if len(horizontal) < 3:
         return lines
-    med = statistics.median(l["h"] for l in lines)
-    body = [i for i, l in enumerate(lines) if l["h"] >= med * 0.72]
+    med = statistics.median(lines[i]["h"] for i in horizontal)
+    body = [i for i in horizontal if lines[i]["h"] >= med * 0.72]
     consumed: set[int] = set()
     # 親文字行ごとに (開始, 終了, ルビ) を集めてから、後ろ側から差し込む
     edits: dict[int, list[tuple[int, int, str]]] = {}
 
-    for i, r in enumerate(lines):
+    for i in horizontal:
+        r = lines[i]
         if r["h"] >= med * 0.72:
             continue
         text = r["text"].replace(" ", "").strip()
@@ -638,8 +660,10 @@ def build_ir(
                 first_content = False
                 continue
 
+            vertical = el.get("direction") == "vertical"
             lines = take_lines(el["box"])
             if lines:
+                lines = reading_order(lines, vertical)
                 texts = [l["text"] for l in lines]
             elif page_lines:
                 # 行がすべてルビとして親文字に取り込まれた、あるいは
@@ -675,12 +699,21 @@ def build_ir(
                 continue
 
             # --- 行頭字下げによる段落の切り出し ---
+            # 字下げは行送りと直交する向き（横組みなら右、縦組みなら下）へずれる。
+            # 閾値は 1 字ぶんなので、字の大きさにあたる辺（横組みは高さ、縦組みは幅）
+            # の中央値から取る。縦組みで h を使うと行の長さが閾値になって発動しない。
             if lines:
-                left = min(l["x0"] for l in lines)
-                unit = statistics.median(l["h"] for l in lines) * 0.45
+                if vertical:
+                    unit = statistics.median(l["w"] for l in lines) * 0.45
+                    head = min(l["y0"] for l in lines)
+                    offsets = [l["y0"] - head for l in lines]
+                else:
+                    unit = statistics.median(l["h"] for l in lines) * 0.45
+                    head = min(l["x0"] for l in lines)
+                    offsets = [l["x0"] - head for l in lines]
                 chunks: list[dict] = []
-                for l in lines:
-                    indented = (l["x0"] - left) > unit
+                for l, offset in zip(lines, offsets):
+                    indented = offset > unit
                     if not chunks or indented:
                         chunks.append({"lines": [l["text"]], "indented": indented})
                     else:
