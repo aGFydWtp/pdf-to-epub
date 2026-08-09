@@ -41,7 +41,14 @@ from book_ir import (
     parse_pages,
     rows_of,
 )
-from llm_proofread import chunk_cache_path, chunk_lines, run_chunk, validate
+from llm_proofread import (
+    DEFAULT_BOOK_CONTEXT,
+    ChunkJob,
+    chunk_cache_path,
+    chunk_lines,
+    run_chunk,
+    validate,
+)
 
 
 def load_json_or_die(path: Path) -> dict:
@@ -408,6 +415,8 @@ def proofread_chapter(
     max_chars: int,
     max_lines: int,
     timeout: int,
+    *,
+    book_context: str,
 ) -> list[dict]:
     """章 1 つ分の校正を行い、fixes（{"page","before","after","why"}）のリストを返す。
 
@@ -424,8 +433,19 @@ def proofread_chapter(
     chunks = chunk_lines(lines, max_chars, max_lines)
     fixes: list[dict] = []
     for ci, (a, b) in enumerate(chunks):
+        # run_chunk とキャッシュ名の照合が同じ job を見るようにしておく
+        # （別々に引数を並べると、片方だけ直したときに静かにずれる）
+        job = ChunkJob(
+            index=ci,
+            lines=lines[a:b],
+            offset=a,
+            model=model,
+            cache_dir=cache_dir,
+            timeout=timeout,
+            book_context=book_context,
+        )
         try:
-            _, edits = run_chunk((ci, lines[a:b], a, model, cache_dir, timeout))
+            _, edits = run_chunk(job)
         except FileNotFoundError as e:
             raise SystemExit(
                 "claude CLI が見つかりません（校正には `claude` コマンドが PATH 上に必要です）。"
@@ -433,7 +453,7 @@ def proofread_chapter(
             ) from e
         # run_chunk は失敗（rc≠0・タイムアウト）を空リストで返しキャッシュも書かない。
         # 「修正 0 件」と区別が付かないため、キャッシュ未生成なら失敗として中断する
-        cache = chunk_cache_path(cache_dir, ci, lines[a:b], a, model)
+        cache = chunk_cache_path(job)
         if not cache.exists():
             raise RuntimeError(
                 f"校正チャンク {cache_dir.name}/{cache.stem} が失敗しました"
@@ -549,6 +569,7 @@ def run(args):
                 pool.submit(
                     proofread_chapter, blocks, (c["start"], c["end"]), cache_dir,
                     args.model, args.max_chars, args.max_lines, args.timeout,
+                    book_context=args.book_context,
                 )
             )
 
@@ -669,6 +690,12 @@ def main():
     parser.add_argument("--cover-page", type=int, default=1, help="カバーに使う PDF ページ")
 
     parser.add_argument("--model", default="sonnet", help="校正に使う claude -p のモデル")
+    parser.add_argument(
+        "--book-context", default=DEFAULT_BOOK_CONTEXT,
+        help="底本の分野を校正プロンプトへ伝える一文（例: 「底本は B2B SaaS の営業組織を扱う"
+             "実務書で、マーケティング・営業のカタカナ語と英略語が頻出します。」）。"
+             "変更するとキャッシュキーも変わるため、該当チャンクは校正しなおす（再課金）",
+    )
     parser.add_argument("--proofread-workers", type=int, default=2, help="章を並列校正する数")
     parser.add_argument("--max-chars", type=int, default=6000, help="校正 1 チャンクの文字数上限")
     parser.add_argument("--max-lines", type=int, default=50, help="校正 1 チャンクの行数上限")

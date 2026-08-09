@@ -13,12 +13,20 @@ import re
 import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from pathlib import Path
+
+# 底本の分野を伝えるヒント。本ごとに --book-context で差し替える。
+# 既定は分野中立にしておく。特定ジャンルを決め打ちすると、実態と合わない本には
+# 誤ったドメイン前提を与えることになり、分野固有語の判断をかえって狂わせる。
+DEFAULT_BOOK_CONTEXT = (
+    "底本の分野は指定されていません。"
+    "分野固有の用語や固有名詞は、確実に OCR 誤認識と言えない限りそのままにしてください。"
+)
 
 PROMPT = """あなたは日本語の書籍を校正する校正者です。
 以下は、スキャンした書籍を OCR し、青空文庫形式に変換したテキストの一部です。
-行番号を付けて示します。底本は時間論を扱う哲学の論集で、哲学・心理学・物理学の
-専門用語と、欧文の人名・書名が頻出します。
+行番号を付けて示します。{book_context}
 
 【仕事】
 OCR の誤認識だけを指摘してください。文章の書き換え・要約・表現の改善はしないでください。
@@ -90,52 +98,69 @@ def extract_json(output: str) -> list[dict]:
     return data if isinstance(data, list) else []
 
 
-def chunk_cache_path(cache_dir: Path, index: int, lines: list[str], offset: int, model: str) -> Path:
+@dataclass
+class ChunkJob:
+    """1 チャンク分の校正に必要なものをひとまとめにしたもの。
+
+    プロンプトを決める要素とキャッシュキーを同じオブジェクトから読ませるための型。
+    引数の並びで渡していると、run_chunk とキャッシュ存在チェックへ別々の値を
+    渡してしまい（pdf_to_epub 側は両方を呼ぶ）、ずれても静かに壊れる。
+    """
+
+    index: int
+    lines: list[str]
+    offset: int
+    model: str
+    cache_dir: Path
+    timeout: int
+    book_context: str = DEFAULT_BOOK_CONTEXT
+
+
+def chunk_cache_path(job: ChunkJob) -> Path:
     """そのチャンクの校正結果を置くパスを返す。
 
     チャンク番号だけをキーにすると、本文を直したのに古い結果が返ってきてしまう。
     キャッシュされた修正は before と行番号で位置を指すので、本文が変われば
     before はどこにも一致せず、修正が黙って捨てられる（実際に本文の読み順を
     直したとき、校正が 282 件から 56 件へ激減して顕在化した）。
-    そこで、プロンプトを決めるもの（モデル・行番号のオフセット・本文）を
+    そこで、プロンプトを決めるもの（モデル・底本の説明・行番号のオフセット・本文）を
     すべてハッシュに入れる。合わないキャッシュは自然にミスして無視される。
     """
 
-    payload = "\x00".join([model, str(offset), *lines])
+    payload = "\x00".join([job.model, job.book_context, str(job.offset), *job.lines])
     digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()
-    return cache_dir / f"c{index:04d}_{digest[:12]}.json"
+    return job.cache_dir / f"c{job.index:04d}_{digest[:12]}.json"
 
 
-def run_chunk(job) -> tuple[int, list[dict]]:
-    index, lines, offset, model, cache_dir, timeout = job
-    cache = chunk_cache_path(cache_dir, index, lines, offset, model)
+def run_chunk(job: ChunkJob) -> tuple[int, list[dict]]:
+    cache = chunk_cache_path(job)
     if cache.exists():
-        return index, json.loads(cache.read_text(encoding="utf-8"))
+        return job.index, json.loads(cache.read_text(encoding="utf-8"))
 
-    numbered = "\n".join(f"{offset + i + 1}: {l}" for i, l in enumerate(lines))
+    numbered = "\n".join(f"{job.offset + i + 1}: {l}" for i, l in enumerate(job.lines))
     try:
         proc = subprocess.run(
             # --strict-mcp-config: 校正に MCP は不要。全 MCP 設定を無視して起動を軽くする
-            ["claude", "-p", "--strict-mcp-config", "--model", model],
-            input=PROMPT.format(text=numbered),
+            ["claude", "-p", "--strict-mcp-config", "--model", job.model],
+            input=PROMPT.format(book_context=job.book_context, text=numbered),
             capture_output=True,
             text=True,
-            timeout=timeout,
+            timeout=job.timeout,
         )
     except subprocess.TimeoutExpired:
-        print(f"  chunk {index}: タイムアウト", file=sys.stderr)
-        return index, []
+        print(f"  chunk {job.index}: タイムアウト", file=sys.stderr)
+        return job.index, []
 
     if proc.returncode != 0:
         print(
-            f"  chunk {index}: claude 失敗 rc={proc.returncode} {proc.stderr[:200]}",
+            f"  chunk {job.index}: claude 失敗 rc={proc.returncode} {proc.stderr[:200]}",
             file=sys.stderr,
         )
-        return index, []
+        return job.index, []
 
     edits = extract_json(proc.stdout)
     cache.write_text(json.dumps(edits, ensure_ascii=False), encoding="utf-8")
-    return index, edits
+    return job.index, edits
 
 
 def sanitize(text: str) -> str:
@@ -222,6 +247,12 @@ def main():
     parser.add_argument("--log", default="claudedocs/proofread_log.md", help="校正ログ")
     parser.add_argument("--cache-dir", default="proofread_cache", help="応答のキャッシュ先")
     parser.add_argument("--model", default="sonnet", help="claude -p に渡すモデル")
+    parser.add_argument(
+        "--book-context", default=DEFAULT_BOOK_CONTEXT,
+        help="底本の分野をプロンプトへ伝える一文（例: 「底本は B2B SaaS の営業組織を扱う"
+             "実務書で、マーケティング・営業のカタカナ語と英略語が頻出します。」）。"
+             "変更するとキャッシュキーも変わるため、該当チャンクは校正しなおす",
+    )
     parser.add_argument("--max-chars", type=int, default=6000, help="1 チャンクの文字数上限")
     parser.add_argument("--max-lines", type=int, default=50, help="1 チャンクの行数上限")
     parser.add_argument("--workers", type=int, default=4, help="並列実行数")
@@ -239,7 +270,15 @@ def main():
     print(f"{len(lines):,} 行 / {len(chunks)} チャンク / モデル {args.model} / 並列 {args.workers}")
 
     jobs = [
-        (i, lines[a:b], a, args.model, cache_dir, args.timeout)
+        ChunkJob(
+            index=i,
+            lines=lines[a:b],
+            offset=a,
+            model=args.model,
+            cache_dir=cache_dir,
+            timeout=args.timeout,
+            book_context=args.book_context,
+        )
         for i, (a, b) in enumerate(chunks)
     ]
     results: dict[int, list[dict]] = {}
@@ -278,6 +317,7 @@ def main():
             f"- 入力: `{args.input}`",
             f"- 出力: `{args.output}`",
             f"- モデル: `{args.model}` / チャンク数: {len(chunks)}",
+            f"- 底本の説明: {args.book_context}",
             f"- 適用: {len(applied)} 件 / 却下: {len(rejected)} 件 / 見出し注記の再生成: {fixed_headings} 件",
         ],
         applied,
