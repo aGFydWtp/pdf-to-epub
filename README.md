@@ -47,14 +47,17 @@ uv run --project "$PIPE" python "$PIPE/book_meta.py" --title "時間を哲学す
   見つからない場合は警告だけ出して `--title` などの指定値にフォールバックする
 - `--title` / `--author` / `--publisher`: 書誌情報。API より常に優先される。
   `--title` は `--dry-run` 以外で必須（`--isbn` で取得できた場合を除く）
-- `--toc-pages` / `--page-offset`: 印刷目次のページ範囲と、書籍ページ番号→PDF ページ番号の補正
+- `--toc-pages` / `--page-offset`: 印刷目次のページ範囲と、書籍ページ番号→PDF ページ番号の補正。
+  `--toc-pages` は章境界の割り出しと、そのページを本文から除外する根拠の両方に使う
+  （EPUB の目次は nav.xhtml が担うため。範囲がずれると印刷目次が本文へ二重掲載される）
 - `--horizontal`: 横書き（`horizontal-tb`）で出力する。既定は縦書き（`vertical-rl`）。
   縦書きでは spine に `page-progression-direction="rtl"` が付き、
   `primary-writing-mode` メタが `vertical-rl` になる。`--horizontal` 指定時は
   `page-progression-direction` を付けず（既定の `ltr`）、メタは `horizontal-lr` になる
 - `--dry-run`: 章境界の確認まで（LLM 校正を行わないので課金なし）
 
-`--horizontal` は `pdf_to_epub.py` と `to_epub.py` の両方で同じ意味で使える。
+`--horizontal` と `--toc-pages` は `pdf_to_epub.py` と `to_epub.py` の両方で同じ意味で使える
+（`to_epub.py` を直接使って本文だけ組み直すときも `--toc-pages` を付けること）。
 
 詳細な手順・引数の決め方・中断再開の方法は
 [.claude/skills/pdf-to-epub/SKILL.md](.claude/skills/pdf-to-epub/SKILL.md) を参照。

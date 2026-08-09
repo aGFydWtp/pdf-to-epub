@@ -355,8 +355,9 @@ def uncovered_pages(
     本文 OCR も校正もされず EPUB から丸ごと落ちる（途中や末尾の取りこぼしは直前の章に
     吸収されるので欠落しない）。黙って消えるのが一番まずいので、呼び出し側で警告する。
 
-    目次ページは手順 1 で先に OCR してあり EPUB にも入るので、章プランの外にあっても
-    欠落ではない。--skip-pages ともども対象から外す。
+    目次ページは手順 1 で先に OCR してあり、印刷目次として意図的に本文から除かれる
+    （to_epub.filter_printed_toc）ので、章プランの外にあっても欠落ではない。
+    --skip-pages ともども対象から外す。
     """
 
     pages = set(range(1, n_pdf_pages + 1)) - parse_pages(skip_spec) - toc_pages
@@ -677,6 +678,7 @@ def run(args):
         horizontal=args.horizontal,
         layout_pages=args.layout_pages,
         skip_pages=args.skip_pages,
+        toc_pages=args.toc_pages,
         dpi=args.dpi,
         cover_page=args.cover_page,
         proofread_fixes=str(fixes_path) if fixes_all else None,

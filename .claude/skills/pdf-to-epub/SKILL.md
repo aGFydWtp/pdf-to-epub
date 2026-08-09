@@ -107,7 +107,9 @@ uv run --project "$PIPE" python "$PIPE/pdf_to_epub.py" \
 
 引数の決め方:
 
-- `--toc-pages`: 印刷目次があるページ範囲。目次だけを先に OCR して章境界を割り出す
+- `--toc-pages`: 印刷目次があるページ範囲。目次だけを先に OCR して章境界を割り出し、
+  同じ範囲を本文からも除外する（EPUB の目次は nav.xhtml が担うため）。
+  範囲がずれていると印刷目次が本文へ二重掲載されるので、実際の目次ページに合わせる
 - `--layout-pages`: 目次・索引など、段組みで幾何的に行を復元すべきページ
   （`--toc-pages` と重なってよい。索引ページなどもここに含める）
 - `--skip-pages`: 表紙・白紙・奥付など、本文として出力しない PDF ページ
@@ -163,8 +165,11 @@ uv run --project "$PIPE" python "$PIPE/pdf_to_epub.py" \
 uv run --project "$PIPE" python "$PIPE/ocr_book.py" "BOOK.pdf" -o ocr_json
 uv run --project "$PIPE" python "$PIPE/to_epub.py" -j ocr_json -p "BOOK.pdf" -o "書名.epub" \
   --title "書名" --author "著者名" \
-  --layout-pages 2-3,287-295 --skip-pages 1,301
+  --layout-pages 2-3,287-295 --skip-pages 1,301 --toc-pages 2-3
 ```
+
+`to_epub.py` を直接使うときも `--toc-pages` を付けること。付けないと印刷目次が
+本文へ二重掲載される（`pdf_to_epub.py` は自分の `--toc-pages` をそのまま渡している）。
 
 `to_epub.py` は生成のたびに自己検証（XHTML/OPF/nav の整形式チェック、
 manifest と zip エントリの突合、spine の突合）を内蔵しており、末尾に

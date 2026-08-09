@@ -31,6 +31,7 @@ from book_ir import (
     front_back_re,
     join_lines,
     normalize_text,
+    parse_pages,
     strip_trailing_page_number,
 )
 
@@ -150,14 +151,34 @@ def escape_attr(text: str) -> str:
 # --------------------------------------------------------------------------
 
 
-def filter_printed_toc(blocks: list[dict], keep: bool = False) -> list[dict]:
-    """既定では印刷目次（layout-pages で復元した「目次」見出し配下）を本文から除く。
+def filter_printed_toc(blocks: list[dict], keep: bool = False, toc_pages: str = "") -> list[dict]:
+    """既定では印刷目次を本文から除く（EPUB の目次は nav.xhtml が担うため）。
 
-    索引ページは対象外（見出しが「目次」系でなければ除外は始まらない）。
+    除去区間は --toc-pages で与えられた PDF ページ番号を根拠に決める。見出し文字列を
+    根拠にはしない。印刷目次ページの先頭に「目次」ちょうどの見出しが立つとは限らず、
+    実測でも次のように外れるためである。
+      - 『レベニューオペレーション(RevOps)の教科書』p6-12: 先頭行が 'はじめに2'
+        （柱と最初のエントリが 1 行に連結される）。「目次」の行が 1 本も立たない
+      - 『イスラム教の論理』p10-13: 目次扉が 'イスラム教の論理目次'
+    どちらも見出し一致では 1 ブロックも除去できず、印刷目次がそのまま本文へ二重掲載される。
+
+    --layout-pages は根拠に使えない。索引（本文として残す）も同じ引数で指定する運用
+    だからで、実際 RevOps は `--layout-pages 6-12,327-332` の後半が索引である。
+
+    --skip-pages との衝突はない。build_ir() が skip 指定のページを読む前に落とすので、
+    印刷目次を --skip-pages で回避している既存の指定（『イスラム教の論理』の
+    `--skip-pages 1,10-13,238,239`）と重ねても、除去対象のブロックが最初から
+    存在しないだけで結果は変わらない。
+
+    toc_pages が空のとき（--toc-pages を持たない呼び出し）だけ、従来どおり「目次」
+    ちょうどの見出しから次の見出しまでを除去する経路にフォールバックする。
     """
 
     if keep:
         return blocks
+
+    if toc_pages:
+        return _drop_pages(blocks, parse_pages(toc_pages))
 
     out: list[dict] = []
     skipping = False
@@ -171,6 +192,51 @@ def filter_printed_toc(blocks: list[dict], keep: bool = False) -> list[dict]:
             continue
         out.append(b)
     return out
+
+
+def _drop_pages(blocks: list[dict], pages: set[int]) -> list[dict]:
+    """指定ページに載っているブロックを落とす。
+
+    段落ブロックはページを跨いで連結されうるので、行ごとの実ページ（"pages"）を持つ
+    ものは行単位で落とし、残った行があればブロックとして残す。ブロックの代表ページ
+    （"page"）だけで判定すると、目次ページから本文ページへ跨いだ段落の本文側まで
+    巻き添えで消える。
+    """
+
+    out: list[dict] = []
+    for b in blocks:
+        line_pages = b.get("pages") if b["kind"] == "para" else None
+        if line_pages and len(line_pages) == len(b["lines"]):
+            kept = [(line, p) for line, p in zip(b["lines"], line_pages) if p not in pages]
+            if not kept:
+                continue
+            if len(kept) < len(b["lines"]):
+                b = {**b, "lines": [k[0] for k in kept], "pages": [k[1] for k in kept]}
+                b["page"] = b["pages"][0]
+            out.append(b)
+        elif b["page"] not in pages:
+            out.append(b)
+    return out
+
+
+def printed_toc_warning(toc_pages: str, skip_pages: str, n_removed: int) -> str | None:
+    """印刷目次を 1 ブロックも除去できなかったときに警告文を返す（正常なら None）。
+
+    黙って 0 件だと印刷目次がそのまま本文へ二重掲載され、EPUB を開くまで気づけない。
+
+    --skip-pages で先に落とされたページは除去対象になりようがないので、判定は
+    「--toc-pages のうち --skip-pages に含まれないページ」が空かどうかで行う。
+    印刷目次を --skip-pages で回避している既存の指定に対して空振りの警告を出さない。
+    """
+
+    effective = parse_pages(toc_pages) - parse_pages(skip_pages)
+    if not effective or n_removed:
+        return None
+    return (
+        f"警告: 印刷目次 p{min(effective)}〜p{max(effective)} から除去できたブロックが 0 件です。"
+        "\n  --toc-pages のページ範囲が実際の印刷目次とずれている可能性があります"
+        "（ずれていると印刷目次が本文へ二重掲載されます）。"
+    )
 
 
 # --------------------------------------------------------------------------
@@ -1009,6 +1075,7 @@ def build_epub(
     horizontal: bool = False,
     layout_pages: str = "",
     skip_pages: str = "",
+    toc_pages: str = "",
     dpi: int = 200,
     cover_page: int = 1,
     proofread_fixes: str | None = None,
@@ -1017,7 +1084,13 @@ def build_epub(
     pdf_path, out_path = Path(pdf_path), Path(out_path)
 
     blocks, _ir_stats = build_ir(json_dir, pdf_path, layout_pages=layout_pages, skip_pages=skip_pages)
-    blocks = filter_printed_toc(blocks, keep=keep_printed_toc)
+    n_before = len(blocks)
+    blocks = filter_printed_toc(blocks, keep=keep_printed_toc, toc_pages=toc_pages)
+    if toc_pages and not keep_printed_toc:
+        print(f"印刷目次を本文から除外: {n_before - len(blocks)} ブロック（p{toc_pages}）")
+        warning = printed_toc_warning(toc_pages, skip_pages, n_before - len(blocks))
+        if warning:
+            print(warning)
 
     if proofread_fixes:
         import json as jsonlib
@@ -1151,6 +1224,13 @@ def main():
     parser.add_argument("--horizontal", action="store_true", help="横書きで出力する（既定は縦書き）")
     parser.add_argument("--layout-pages", default="", help="段組を幾何的に復元するページ（例: 2-3,287-295）")
     parser.add_argument("--skip-pages", default="", help="出力しないページ（例: 1,301）")
+    parser.add_argument(
+        "--toc-pages",
+        default="",
+        help="印刷目次のページ範囲（例: 2-3）。この範囲を本文から除外する"
+        "（EPUB の目次は nav.xhtml が担うため）。省略すると「目次」見出しの検出に頼るので、"
+        "目次ページがあるなら指定すること",
+    )
     parser.add_argument("--dpi", type=int, default=200, help="OCR 時と同じ DPI（図版切り出し・カバー用）")
     parser.add_argument("--cover-page", type=int, default=1, help="カバーに使う PDF ページ（1始まり）")
     parser.add_argument("--proofread-fixes", default=None, help="適用する校正 fixes JSON")
@@ -1169,6 +1249,7 @@ def main():
         horizontal=args.horizontal,
         layout_pages=args.layout_pages,
         skip_pages=args.skip_pages,
+        toc_pages=args.toc_pages,
         dpi=args.dpi,
         cover_page=args.cover_page,
         proofread_fixes=args.proofread_fixes,
