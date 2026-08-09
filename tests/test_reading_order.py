@@ -17,12 +17,12 @@ from book_ir import attach_ruby, build_ir, build_lines, reading_order
 CHAR = 30  # 1 文字の一辺（px）
 
 
-def vword(x0: int, y0: int, text: str) -> dict:
+def vword(x0: int, y0: int, text: str, size: int = CHAR) -> dict:
     """縦組みの 1 行。x0 が右にあるほど先に読む"""
 
-    y1 = y0 + CHAR * len(text)
+    y1 = y0 + size * len(text)
     return {
-        "points": [[x0, y0], [x0 + CHAR, y0], [x0 + CHAR, y1], [x0, y1]],
+        "points": [[x0, y0], [x0 + size, y0], [x0 + size, y1], [x0, y1]],
         "content": text,
         "direction": "vertical",
     }
@@ -193,6 +193,62 @@ def test_縦組みページの横組み行をルビとして飲み込まない()
     caption = hword(100, 60, "みだし")  # 仮名だけの横組み行
     lines = build_lines([*body, caption])
     assert "みだし" in [l["text"] for l in attach_ruby(lines)]
+
+
+def test_縦組みのルビが親文字に結合される():
+    """縦組みのルビは親文字の右隣の列。行の幅（＝字の大きさ）で本文と見分ける"""
+
+    lines = build_lines(
+        [
+            vword(300, 100, "かんじ", size=20),  # 親文字 2 字ぶんの長さに収まる
+            vword(270, 100, "漢字"),
+            vword(210, 100, "ほかのほんぶん"),
+        ]
+    )
+    got = reading_order(attach_ruby(lines), vertical=True)
+    assert [l["text"] for l in got] == ["｜漢字《かんじ》", "ほかのほんぶん"]
+
+
+def test_縦組みのルビは列の途中でも_y_で親文字を決める():
+    """親文字の列はページ全体に伸びる。掛かる位置はルビの y だけが決める"""
+
+    lines = build_lines(
+        [
+            vword(300, 210, "きずな", size=15),
+            vword(270, 100, "きょうは絆をたしかめる。"),  # 「絆」は y=220..250
+            vword(210, 100, "つぎのぎょう。"),
+        ]
+    )
+    got = reading_order(attach_ruby(lines), vertical=True)
+    assert [l["text"] for l in got] == ["きょうは｜絆《きずな》をたしかめる。", "つぎのぎょう。"]
+
+
+def test_縦組みで親文字の左隣にある小さい仮名列はルビにしない():
+    """縦組みのルビは右側に付く。左隣の列は次の行であってルビではない"""
+
+    lines = build_lines(
+        [
+            vword(270, 100, "漢字"),
+            vword(240, 100, "かんじ", size=20),  # 親文字の左隣
+            vword(180, 100, "ほかのほんぶん"),
+        ]
+    )
+    assert "かんじ" in [l["text"] for l in attach_ruby(lines)]
+
+
+def test_縦組み段落のルビが本文の行として残らない(tmp_path):
+    """ルビ列が独立した行のまま段落に混ざらないことを build_ir まで通して確かめる"""
+
+    words = [
+        vword(430, 210, "きずな", size=15),
+        vword(400, 100, "きょうは絆をたしかめる。"),
+        vword(340, 100, "つぎのぎょう。"),
+    ]
+    contents = "きょうは絆をたしかめる。\nつぎのぎょう。"
+    json_dir = write_page(tmp_path, words, "vertical", contents)
+    assert paragraphs_of(json_dir) == [
+        ["きょうは｜絆《きずな》をたしかめる。", "つぎのぎょう。"]
+    ]
 
 
 # 『時間を哲学する』p0089 の実測値。「目的/終局」に引き伸ばして掛かる「テロス」の
