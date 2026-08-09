@@ -66,7 +66,10 @@ def test_upright_follows_measured_typesetting_rules(src, expected):
     assert render_inline(normalize_text(src)) == expected
 
 
-@pytest.mark.parametrize("src", ["Web2.0", "1.5GB", "ＭＰ3", "iPhone", "a12b", "12a", "p.12"])
+@pytest.mark.parametrize(
+    "src",
+    ["Web2.0", "Web2.0.3", "1.5GB", "2.0Web", "v1.5", "ＭＰ3", "iPhone", "a12b", "12a", "www.ABC.com"],
+)
 def test_upright_leaves_mixed_alphanumeric_tokens_whole(src):
     """英数字が混在するトークンは丸ごと素通りさせる
 
@@ -77,6 +80,31 @@ def test_upright_leaves_mixed_alphanumeric_tokens_whole(src):
 
     normalized = normalize_text(src)
     assert render_inline(normalized) == normalized
+
+
+@pytest.mark.parametrize(
+    ("src", "expected"),
+    [
+        # 変更前から縦中横になっていた形。ここを巻き込むと黙って退行する
+        ("p.12", f"p.{TCY_OPEN}12</span>"),
+        ("no.99", f"no.{TCY_OPEN}99</span>"),
+        ("Fig.34", f"Fig.{TCY_OPEN}34</span>"),
+        ("Ｖｏｌ.12", f"Vol.{TCY_OPEN}12</span>"),
+        ("第１章p.12", f"第１章p.{TCY_OPEN}12</span>"),
+        # 桁数の規則はドットの後でも変わらない（2桁以外は全角化して正立させる）
+        ("p.5", "p.５"),
+        ("p.123", "p.１２３"),
+    ],
+)
+def test_digits_after_a_latin_period_still_stand_upright(src, expected):
+    """ドットの除外は「直前が数字のとき」だけに絞る
+
+    除外の目的は小数点の右側だけを拾わないこと（'Web2.0' → 'Web2.０' の防止）。
+    ドットを一律に除外すると 'p.12'・'no.99'・'Fig.34' のような「英字＋ドット＋2桁」
+    まで巻き込み、従来効いていた縦中横が消える。
+    """
+
+    assert render_inline(normalize_text(src)) == expected
 
 
 @pytest.mark.parametrize("mark", ["!!", "!?", "?!", "??"])
