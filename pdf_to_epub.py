@@ -29,7 +29,7 @@ import ocr_book
 import to_aozora
 import to_epub
 from book_ir import DASHES, attach_ruby, build_ir, build_lines, normalize_text, parse_pages, rows_of
-from llm_proofread import chunk_lines, run_chunk, validate
+from llm_proofread import chunk_cache_path, chunk_lines, run_chunk, validate
 
 
 def load_json_or_die(path: Path) -> dict:
@@ -323,9 +323,10 @@ def proofread_chapter(
             ) from e
         # run_chunk は失敗（rc≠0・タイムアウト）を空リストで返しキャッシュも書かない。
         # 「修正 0 件」と区別が付かないため、キャッシュ未生成なら失敗として中断する
-        if not (cache_dir / f"c{ci:04d}.json").exists():
+        cache = chunk_cache_path(cache_dir, ci, lines[a:b], a, model)
+        if not cache.exists():
             raise RuntimeError(
-                f"校正チャンク {cache_dir.name}/c{ci:04d} が失敗しました"
+                f"校正チャンク {cache_dir.name}/{cache.stem} が失敗しました"
                 "（claude CLI の認証切れ・タイムアウト等）。原因を解消して再実行すれば"
                 "キャッシュ済みチャンクはスキップされます。"
             )

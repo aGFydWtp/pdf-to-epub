@@ -7,6 +7,7 @@ before が実際にその行へ一意に存在することを確かめてから�
 """
 
 import argparse
+import hashlib
 import json
 import re
 import subprocess
@@ -89,9 +90,25 @@ def extract_json(output: str) -> list[dict]:
     return data if isinstance(data, list) else []
 
 
+def chunk_cache_path(cache_dir: Path, index: int, lines: list[str], offset: int, model: str) -> Path:
+    """そのチャンクの校正結果を置くパスを返す。
+
+    チャンク番号だけをキーにすると、本文を直したのに古い結果が返ってきてしまう。
+    キャッシュされた修正は before と行番号で位置を指すので、本文が変われば
+    before はどこにも一致せず、修正が黙って捨てられる（実際に本文の読み順を
+    直したとき、校正が 282 件から 56 件へ激減して顕在化した）。
+    そこで、プロンプトを決めるもの（モデル・行番号のオフセット・本文）を
+    すべてハッシュに入れる。合わないキャッシュは自然にミスして無視される。
+    """
+
+    payload = "\x00".join([model, str(offset), *lines])
+    digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+    return cache_dir / f"c{index:04d}_{digest[:12]}.json"
+
+
 def run_chunk(job) -> tuple[int, list[dict]]:
     index, lines, offset, model, cache_dir, timeout = job
-    cache = cache_dir / f"c{index:04d}.json"
+    cache = chunk_cache_path(cache_dir, index, lines, offset, model)
     if cache.exists():
         return index, json.loads(cache.read_text(encoding="utf-8"))
 
