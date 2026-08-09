@@ -545,6 +545,13 @@ FRONT_BACK_PAGE_RE = re.compile(
 )
 
 
+# 柱から前付/後付の見出しを拾うときの語彙。「目次」だけは差し引く。
+# 昇格させると to_epub.filter_printed_toc() の「目次見出し配下を本文から除く」
+# ロジックが、今まで発火しなかった本で発火して挙動が変わる。
+# 差し引きの理由は pdf_to_epub.FRONT_BACK_TOC_RE と同じ（あちらは目次パース側）
+FRONT_BACK_HEADER_RE = front_back_re(w for w in FRONT_BACK_WORDS if w not in TOC_SELF_WORDS)
+
+
 def strip_trailing_page_number(title: str) -> str:
     """見出しに貼り付いたページ番号を落とす（「あとがき203」「終章227」→「あとがき」「終章」）。
 
@@ -555,6 +562,22 @@ def strip_trailing_page_number(title: str) -> str:
 
     m = FRONT_BACK_PAGE_RE.match(title)
     return m.group(1) if m else title
+
+
+def front_back_heading_title(text: str) -> str:
+    """前付/後付の見出しとして扱える柱なら、表示に使える 1 行を返す（でなければ空文字）。
+
+    柱にはページ番号が貼り付いて届くことがある（「あとがき203」）。番号を落とした形を
+    返すのは、nav と <title> に番号を出さないためと、同じ見出しの重複判定に使うキーを
+    ページごとにぶれさせないため（素の文字列だと「あとがき」と「あとがき203」が
+    別物になり、同じ節の途中で二度目の昇格が起きて章が分裂する）。
+    """
+
+    first_line = normalize_text(text.split("\n")[0]).strip()
+    title = strip_trailing_page_number(first_line)
+    if title and (FRONT_BACK_HEADER_RE.match(title) or UNNUMBERED_CHAPTER_RE.match(title)):
+        return title
+    return ""
 
 
 def heading_level(text: str) -> str:
@@ -688,6 +711,9 @@ def build_ir(
     pending: list[str] | None = None
     pending_pages: list[int] | None = None
     stats = {"ルビ": 0, "除去": 0}
+    # 前付/後付の見出しとして本の中で既に立っているタイトル（柱からの昇格の重複ガード）。
+    # 見出しが既に立っている節は、後続ページの柱を昇格させてはいけない
+    seen_front_back: set[str] = set()
 
     def flush():
         nonlocal pending, pending_pages
@@ -701,6 +727,24 @@ def build_ir(
             )
         pending = None
         pending_pages = None
+
+    def add_heading(lines: list[str], page_no: int, level: str = "大"):
+        """見出しブロックを積み、大見出しなら前付/後付のタイトルを既出として控える。
+
+        大見出しを積む経路は複数ある（章扉・部扉・段組ページ・section_headings・柱からの
+        昇格）。どれか 1 つでも既出の登録を落とすと、後続ページの柱が「まだ立っていない
+        見出し」と誤認されて二重に昇格し、nav が二重化して節の途中で章が割れる。
+        登録漏れが起きないよう、大見出しの追加は必ずここを通す。
+        """
+
+        flush()
+        blocks.append({"kind": "heading", "level": level, "lines": list(lines), "page": page_no})
+        if level != "大":
+            return
+        for line in lines:
+            title = front_back_heading_title(line)
+            if title:
+                seen_front_back.add(title)
 
     for file in files:
         import json as jsonlib
@@ -734,7 +778,7 @@ def build_ir(
             flush()
             for row in rows_of(page_lines, width, height):
                 if row in ("目次", "事項索引", "人名索引", "索引"):
-                    blocks.append({"kind": "heading", "level": "大", "lines": [row], "page": page_no})
+                    add_heading([row], page_no)
                 else:
                     blocks.append({"kind": "raw", "text": row, "page": page_no})
             continue
@@ -752,9 +796,8 @@ def build_ir(
             and re.match(r"^第\s*[ⅠⅡⅢⅣⅤ]\s*部", normalize_text(page_text))
             and not data["tables"]
         ):
-            flush()
             titles = [l["text"] for l in page_lines]
-            blocks.append({"kind": "heading", "level": "大", "lines": titles[:3], "page": page_no})
+            add_heading(titles[:3], page_no)
             for extra in titles[3:]:
                 text = normalize_text(extra)
                 if text:
@@ -765,11 +808,18 @@ def build_ir(
         if len(page_text) < 120 and not data["tables"]:
             chapter_head = chapter_title_page(page_lines)
             if chapter_head:
-                flush()
-                blocks.append(
-                    {"kind": "heading", "level": "大", "lines": chapter_head, "page": page_no}
-                )
+                add_heading(chapter_head, page_no)
                 continue
+
+        # このページで section_headings として取れている前付/後付の見出しを先に控える。
+        # 同じページの柱を昇格させると見出しが二重になり、後続ページの柱を昇格させると
+        # 節の途中で章が切れる。要素を 1 つずつ見ていては手遅れなので先読みする
+        for par in data["paragraphs"]:
+            if par.get("role") != "section_headings":
+                continue
+            known = front_back_heading_title(par.get("contents") or "")
+            if known:
+                seen_front_back.add(known)
 
         consumed: list[bool] = [False] * len(page_lines)
         fig_index = 0
@@ -837,6 +887,25 @@ def build_ir(
                 continue
 
             y_top, y_bottom = el["box"][1], el["box"][3]
+
+            # --- 柱としてしか現れない前付/後付の見出しを大見出しへ昇格させる ---
+            # 前付の見出しが独立した要素として取れず、柱（page_header）としてだけ
+            # 現れる本がある。柱ごと捨てると大見出しが 1 つも立たず、その範囲は
+            # 本文としては出るのに nav から丸ごと落ちる。
+            # フッタ柱（page_footer）は対象外: そのページの本文ブロックより後ろに
+            # 見出しが来るため、split_chapters_and_nav がそのページの本文を
+            # 前の章へ押し込んでしまう。
+            # 昇格しなかった柱は下の除去へ落ちる（＝従来どおりの挙動）
+            if el["role"] == "page_header":
+                title = front_back_heading_title(raw)
+                if title and title not in seen_front_back:
+                    # level は heading_level() の戻り値に依らず「大」で固定する。
+                    # 大でなければ split_chapters_and_nav が nav ノードを作らず、
+                    # 昇格させた意味がなくなる
+                    add_heading([title], page_no)
+                    first_content = False
+                    continue
+
             if el["role"] in ("page_header", "page_footer") or (
                 (y_bottom < height * 0.06 or y_top > height * 0.93)
                 and len(texts) == 1
@@ -847,9 +916,7 @@ def build_ir(
                 continue
 
             if el["role"] == "section_headings":
-                flush()
-                level = heading_level(raw)
-                blocks.append({"kind": "heading", "level": level, "lines": texts, "page": page_no})
+                add_heading(texts, page_no, heading_level(raw))
                 first_content = False
                 continue
 

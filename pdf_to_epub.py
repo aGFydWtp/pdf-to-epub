@@ -229,6 +229,13 @@ def ensure_page_ocr(pdf_doc, json_dir: Path, page_no: int, dpi: int, device: str
 # --------------------------------------------------------------------------
 
 
+def is_front_back_entry(entry: dict) -> bool:
+    """目次エントリが前付/後付（本文と別ノンブルでありうる範囲）かどうか"""
+
+    title = normalize_text(entry["title"]).strip()
+    return bool(FRONT_BACK_TOC_RE.match(title) or UNNUMBERED_CHAPTER_TOC_RE.match(title))
+
+
 def resolve_offset(
     entries: list[dict],
     pdf_doc,
@@ -256,7 +263,18 @@ def resolve_offset(
         raise SystemExit(
             "目次から算用数字のページ番号を抽出できませんでした。--page-offset を指定してください。"
         )
-    target = min(arabic, key=lambda e: e["page_num"])
+    # 前付は本文と別ノンブルで組まれていることが多く、照合ターゲットに選ぶと
+    # 前付の領域でだけ正しい offset を返して本文の全章がずれる。しかも黙って通る。
+    # 本文のエントリを優先し、無いときだけ前付へ落とす（前付しか無い本を即死させない）
+    body = [e for e in arabic if not is_front_back_entry(e)]
+    candidates = body or arabic
+    if not body:
+        print(
+            "目次に本文の章エントリが無いため、前付/後付のエントリでページオフセットを"
+            "照合します（前付が本文と別ノンブルの本ではずれます）。",
+            flush=True,
+        )
+    target = min(candidates, key=lambda e: e["page_num"])
 
     # 見出し番号の接頭辞・末尾に貼り付いたページ番号・OCR ノイズの残り数字を落として
     # 「本文にもほぼ同じ形で現れるはずの説明部分」だけを照合キーワードにする。
@@ -351,29 +369,85 @@ def build_chapter_plan(entries: list[dict], offset: int, n_pdf_pages: int) -> li
     """目次の部/大見出しエントリから章ごとの PDF ページ範囲を確定する"""
 
     listed = [e for e in entries if e["page_num"] is not None and not e["is_roman"]]
-    chapters = sorted(listed, key=lambda e: e["page_num"])
-    # 目次に並んだ順とページ番号の昇順は一致するはず。食い違うのはページ番号の
-    # OCR 誤読なので、黙って章の範囲を作らず落とす（--toc-fix で補正できる）
-    if [e["page_num"] for e in listed] != [e["page_num"] for e in chapters]:
-        broken = [
-            f"{cur['title']!r}(page={cur['page_num']})"
-            for prev, cur in zip(listed, listed[1:])
-            if cur["page_num"] <= prev["page_num"]
-        ]
+    # 目次に並んだ順とページ番号は狭義単調増加のはず。食い違うのはページ番号の
+    # OCR 誤読なので、黙って章の範囲を作らず落とす（--toc-fix で補正できる）。
+    #
+    # 同値も違反として検出する。sorted() は安定なので同値では並びが変わらず、
+    # 並び替えの有無で判定すると素通りしてしまう。素通りすると前のエントリの end が
+    # start - 1 になって零長範囲となり、下の範囲チェックで黙って消える
+    # （しかも後続エントリが同じページを覆うので uncovered_pages でも警告されない）
+    broken = [
+        f"{cur['title']!r}(page={cur['page_num']})"
+        for prev, cur in zip(listed, listed[1:])
+        if cur["page_num"] <= prev["page_num"]
+    ]
+    if broken:
         raise SystemExit(
             "目次のページ番号が並び順と矛盾しています（OCR 誤読の可能性）: "
             + " / ".join(broken)
             + "\n正しい書籍ページ番号を --toc-fix \"第3章=81\" のように指定してください。"
         )
     plan = []
-    for i, e in enumerate(chapters):
+    for i, e in enumerate(listed):
         start = e["page_num"] + offset
-        end = chapters[i + 1]["page_num"] + offset - 1 if i + 1 < len(chapters) else n_pdf_pages
+        end = listed[i + 1]["page_num"] + offset - 1 if i + 1 < len(listed) else n_pdf_pages
         end = min(end, n_pdf_pages)
         if start < 1 or start > n_pdf_pages or start > end:
+            # 黙って落とすと、その章の範囲が本文 OCR も校正もされないまま消える。
+            # どのエントリをなぜ落としたかは必ず人に見せる
+            print(
+                f"警告: 目次エントリ [{e['level']}] {e['title']!r}(page={e['page_num']}) を"
+                f"章プランから外しました（オフセット {offset} を足すと PDF p{start}〜p{end} となり、"
+                f"p1〜p{n_pdf_pages} に収まりません）。この範囲は本文 OCR も校正もされません。"
+                "\n  --toc-fix でページ番号を補うか --page-offset を見直してください。",
+                flush=True,
+            )
             continue
         plan.append({"title": e["title"], "level": e["level"], "start": start, "end": end})
     return plan
+
+
+def cover_front_matter(
+    plan: list[dict], n_pdf_pages: int, skip_spec: str, toc_pages: set[int]
+) -> list[dict]:
+    """章プランの先頭より前に残ったページを、1 章ぶんのセグメントで覆う。
+
+    最終章の end は n_pdf_pages に張り付くので後付は必ずどれかの章に吸収されるが、
+    先頭側は plan[0]["start"] より前が丸ごと無主地になり、本文 OCR も校正もされない
+    まま EPUB から落ちる。末尾側と対称にするために先頭にもセグメントを足す。
+
+    ここで足すのは「どのページを OCR し、どのページを校正するか」だけで、EPUB の
+    章構成には影響しない（to_epub.build_epub は plan を参照せず、page_filter なしで
+    IR を組み直す）。
+
+    範囲に --skip-pages のページが混ざるのは無害（build_ir が page_filter より先に
+    skip を落とすので行が残らず、行が 1 つも無い章に proofread_chapter は claude を
+    呼ばない）。目次ページは違う: build_ir に目次ページを除外する機構は無く、実際の
+    テキストを持つので校正対象に入り、その分の LLM コストが余分にかかる（EPUB の構造や
+    内容は壊れない）。目次ページは --skip-pages にも入れておくと、この無駄が出ない。
+    """
+
+    uncovered = uncovered_pages(plan, n_pdf_pages, skip_spec, toc_pages)
+    if not uncovered:
+        return plan
+    if plan:
+        head = [p for p in uncovered if p < plan[0]["start"]]
+        if not head:
+            # 先頭側は埋まっている。途中や末尾の穴はここでは埋めない
+            # （直前の章に吸収されるのが正常で、埋めると章の範囲を偽ることになる）
+            return plan
+        start, end = min(head), plan[0]["start"] - 1
+    else:
+        # 目次エントリが 1 件も章にならなかった本。このままだと 1 ページも
+        # OCR されず校正もされないので、未カバー範囲をまるごと 1 章にする
+        head = uncovered
+        start, end = min(uncovered), max(uncovered)
+    print(
+        f"章プランの先頭より前に {len(head)} ページ残っていたため、「前付」として "
+        f"PDF p{start}〜p{end}（{end - start + 1} ページ）を章プランに追加しました。",
+        flush=True,
+    )
+    return [{"title": "前付", "level": "大", "start": start, "end": end}] + plan
 
 
 # --------------------------------------------------------------------------
@@ -517,6 +591,7 @@ def run(args):
 
     # 4. 章境界確定
     plan = build_chapter_plan(entries, offset, n_pages)
+    plan = cover_front_matter(plan, n_pages, args.skip_pages, set(toc_pages))
     print(f"\n章境界: {len(plan)} 章（オフセット {offset}）", flush=True)
     for i, c in enumerate(plan):
         print(f"  [{i}][{c['level']}] {c['title']!r}: PDF p{c['start']}〜p{c['end']} ({c['end'] - c['start'] + 1} ページ)", flush=True)
