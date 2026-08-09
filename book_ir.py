@@ -293,17 +293,20 @@ def attach_ruby(lines: list[dict]) -> list[dict]:
     return [l for i, l in enumerate(lines) if i not in consumed]
 
 
-def find_gutter(lines: list[dict], page_width: int) -> float | None:
-    """段間の空白帯（ノド）を x 方向の被覆から探し、その中心を返す。
+def find_gutter(lines: list[dict], extent: int, vertical: bool = False) -> float | None:
+    """段間の空白帯（ノド）を、段が並ぶ方向の被覆から探して中心を返す。
 
-    1 段組でも行末は揃わないため、行頭 x や行末 x だけでは判別できない。
-    どの行にも覆われない縦帯がページ中央付近にあるかどうかで判定する。
+    1 段組でも行末は揃わないため、行頭・行末の座標だけでは判別できない。
+    どの行にも覆われない帯がページ中央付近にあるかどうかで判定する。
+    横組みは段が左右に並ぶので x 方向、縦組みは段が上下に並ぶので y 方向を見る
+    （extent はその方向のページの大きさ＝横組みなら幅、縦組みなら高さ）。
     """
 
-    lo, hi = int(page_width * 0.35), int(page_width * 0.65)
+    k0, k1 = ("y0", "y1") if vertical else ("x0", "x1")
+    lo, hi = int(extent * 0.35), int(extent * 0.65)
     counts = [0] * (hi - lo)
     for l in lines:
-        a, b = max(lo, int(l["x0"])), min(hi, int(l["x1"]))
+        a, b = max(lo, int(l[k0])), min(hi, int(l[k1]))
         for x in range(a, b):
             counts[x - lo] += 1
 
@@ -318,24 +321,33 @@ def find_gutter(lines: list[dict], page_width: int) -> float | None:
                 best = (run_start, i)
             run_start = None
 
-    if best is None or (best[1] - best[0]) < page_width * 0.02:
+    if best is None or (best[1] - best[0]) < extent * 0.02:
         return None
     split = lo + (best[0] + best[1]) / 2
-    left = sum(1 for l in lines if l["x0"] < split)
-    if min(left, len(lines) - left) < len(lines) * 0.2:
+    first = sum(1 for l in lines if l[k0] < split)
+    if min(first, len(lines) - first) < len(lines) * 0.2:
         return None
     return split
 
 
-def rows_of(lines: list[dict], page_width: int) -> list[str]:
-    """段組・行位置から視覚的な行を復元する（目次・索引ページ向け）"""
+def rows_of(lines: list[dict], page_width: int, page_height: int | None = None) -> list[str]:
+    """段組・行位置から視覚的な行を復元する（目次・索引ページ向け）。
+
+    横組みは y の近い語をひとつの行にまとめて x 昇順に連結し、縦組みは x の近い語を
+    ひとつの行（＝1 カラム）にまとめて y 昇順に連結する。縦組みの目次は章タイトルの
+    真下にページ番号が置かれるので、この軸の入れ替えでページ番号まで同じ行に入る。
+    軸を入れ替えないと全カラムが 1 行に連結され、行頭の「第○章」を拾えなくなる。
+    """
 
     if not lines:
         return []
 
-    split = find_gutter(lines, page_width)
+    vertical = sum(1 for l in lines if l["vertical"]) * 2 > len(lines)
+    extent = (page_height or page_width) if vertical else page_width
+    split = find_gutter(lines, extent, vertical)
+    key = "y0" if vertical else "x0"
     groups = (
-        [[l for l in lines if l["x0"] < split], [l for l in lines if l["x0"] >= split]]
+        [[l for l in lines if l[key] < split], [l for l in lines if l[key] >= split]]
         if split
         else [lines]
     )
@@ -343,13 +355,22 @@ def rows_of(lines: list[dict], page_width: int) -> list[str]:
     out: list[str] = []
     for group in groups:
         rows: list[list[dict]] = []
-        for l in sorted(group, key=lambda d: (d["y0"], d["x0"])):
-            if rows and l["y0"] < rows[-1][-1]["y1"] - rows[-1][-1]["h"] * 0.4:
+        # 縦組みは右の行から左へ読むので x0 の降順、横組みは上の行から下へ読むので y0 の昇順
+        order = (lambda d: (-d["x0"], d["y0"])) if vertical else (lambda d: (d["y0"], d["x0"]))
+        for l in sorted(group, key=order):
+            prev = rows[-1][-1] if rows else None
+            same_row = prev is not None and (
+                l["x1"] > prev["x0"] + prev["w"] * 0.4
+                if vertical
+                else l["y0"] < prev["y1"] - prev["h"] * 0.4
+            )
+            if same_row:
                 rows[-1].append(l)
             else:
                 rows.append([l])
         for row in rows:
-            text = "　".join(x["text"].strip() for x in sorted(row, key=lambda d: d["x0"]))
+            inner = sorted(row, key=(lambda d: d["y0"]) if vertical else (lambda d: d["x0"]))
+            text = "　".join(x["text"].strip() for x in inner)
             text = normalize_text(text)
             if text:
                 out.append(text)
@@ -413,16 +434,120 @@ def chapter_title_page(page_lines: list[dict]) -> list[str] | None:
     return [head, title] if title else [head]
 
 
+UNNUMBERED_CHAPTER_WORDS = ("序章", "終章", "補章", "プロローグ", "エピローグ")
+
+# 前付/後付の見出し。本文の見出し（「解説を書くということ」「参考にした資料」）と
+# 紛れるため、語の直後で切れていることまで確かめる。
+# 「引用参考文献」は中黒を空白として読んだ OCR（「引用 参考文献」）が正規化で
+# 詰められた形。正規化が CJK 隣接空白を落とすので、中黒版とは別の語になる
+FRONT_BACK_WORDS = (
+    "はじめに", "まえがき", "序文", "序論", "序説", "序", "凡例",
+    "あとがきにかえて", "あとがき", "おわりに", "むすび", "結び", "結語", "跋",
+    "解説", "補遺", "付録", "附録", "年表", "謝辞",
+    "引用・参考文献", "引用参考文献", "参考文献一覧", "参考文献", "文献一覧",
+    "参考図書", "初出一覧",
+    "事項索引", "人名索引", "索引", "註", "注", "目次",
+)
+
+FRONT_BACK_PREFIX = r"(?:訳者|著者|編者|監修者|文庫版|新装版|増補版|新版|日本語版)?"
+
+# 印刷目次ページ自身を指す語。目次側の語彙からは差し引く（pdf_to_epub 参照）
+TOC_SELF_WORDS = ("目次",)
+
+# 語の直後で切れていることを要求する境界。見出しには級数の小さいページ番号が
+# 貼り付いたまま届くことがある（「はじめに12」「はじめにiii」）ので、行末に加えて
+# 数字とローマ数字も境界として認める。範囲は TRAILING_ROMAN_RE と揃えてある
+WORD_END = r"(?=$|\d|[ivxlcIVXLC])"
+
+
+def _alternation(words) -> str:
+    # 長い語から並べるのは可読性のため。Python の選択肢は後続の照合に失敗すると
+    # 後戻りするので、並び順は判定結果も一致範囲も変えない
+    return "|".join(re.escape(w) for w in sorted(words, key=len, reverse=True))
+
+
+def front_back_re(words) -> re.Pattern:
+    """前付/後付の語から、語の直後で行が切れていることを要求する正規表現を作る"""
+
+    return re.compile(rf"^{FRONT_BACK_PREFIX}(?:{_alternation(words)}){WORD_END}")
+
+
+FRONT_BACK_RE = front_back_re(FRONT_BACK_WORDS)
+
+# 番号を持たない章。本文用と目次用で判定が非対称なのは、入力の形が違うため。
+# 本文の見出しは heading_level() が先頭トークンを切り出してから当てるので、
+# 終端境界を課しても章題を取りこぼさず、「終章に向けて」のような句を章に
+# 昇格させずに済む（トークン全体が「終章・あとがき」になるので中黒の除外も不要）。
+UNNUMBERED_CHAPTER_RE = re.compile(rf"^(?:{_alternation(UNNUMBERED_CHAPTER_WORDS)}){WORD_END}")
+
+# 目次側は rows_of() が章題もページ番号も 1 行に連結して渡すので
+# （「序章町内会って入らなくてもいいの？17」）、終端境界を課すと正当な序章エントリを
+# 落とし、その範囲が章プランから丸ごと消える。前方一致のまま、参考文献の区分ラベル
+# 「終章・あとがき」だけを直後の中黒で弾く。
+# 代わりに目次行「序章的な考察12」を章と誤認する余地が残るが、締めて正当な章を
+# 落とすほうが害が大きい（本文 OCR も校正もされずに欠落する）ので受容し、
+# dry-run の章境界一覧を人が確認する運用で補う
+UNNUMBERED_CHAPTER_TOC_RE = re.compile(
+    rf"^(?:{_alternation(UNNUMBERED_CHAPTER_WORDS)})(?![・·])"
+)
+
+# 序数を伴うのが普通の語。「付録1」「註2」の数字が序数かページ番号かは
+# 区別できないので、落とさないほうを選ぶ。落とすと付録が複数ある本や部ごとに
+# 後注を置く本で、nav に同じタイトルが並んでしまう
+ORDINAL_SUFFIX_WORDS = ("付録", "附録", "註", "注")
+
+PAGE_NUMBER_WORDS = tuple(
+    w for w in FRONT_BACK_WORDS if w not in ORDINAL_SUFFIX_WORDS
+) + UNNUMBERED_CHAPTER_WORDS
+
+# 「語彙表の語＋ページ番号」の形だけを捉える。無条件に末尾の数字を落とすと
+# 「Column 3」が「Column」になって壊れるので、数字を取り除いた残りが語彙表の語に
+# 完全一致するときだけ削る。「終章2020年の町内会」のような正当な章題は末尾が
+# 数字ではないので影響を受けない
+FRONT_BACK_PAGE_RE = re.compile(
+    rf"^({FRONT_BACK_PREFIX}(?:{_alternation(PAGE_NUMBER_WORDS)}))(?:\d+|[ivxlcIVXLC]+)$"
+)
+
+
+def strip_trailing_page_number(title: str) -> str:
+    """見出しに貼り付いたページ番号を落とす（「あとがき203」「終章227」→「あとがき」「終章」）。
+
+    級数の小さいページ番号は柱として除去しきれず見出しに連結されて届くことがある。
+    heading_level() はそれを見込んで境界に数字を認めるので、そのままだと nav と
+    <title> に「あとがき203」が出てしまう。
+    """
+
+    m = FRONT_BACK_PAGE_RE.match(title)
+    return m.group(1) if m else title
+
+
 def heading_level(text: str) -> str:
-    head = text.split("\n")[0].strip()
+    # 受け取るのは OCR の生テキストなので、中点や全角数字・余分な空白が
+    # 混ざったまま（「引用· 参考文献」）照合すると前付/後付の判定を取りこぼす
+    first_line = text.split("\n")[0].strip()
+    head = normalize_text(first_line).strip()
+    # 番号付きは行全体で見る。先頭トークンだと「第 12 章 まとめ」が「第」になって落ちる
     if re.match(r"^第\s*[ⅠⅡⅢⅣⅤ]\s*部", head):
         return "大"
     if re.match(r"^第\s*\d+\s*章", head):
         return "大"
     if re.match(r"^Column\s*\d+", head, re.IGNORECASE):
         return "大"
-    if head in ("はじめに", "あとがき", "おわりに", "目次", "目 次", "索引", "事項索引", "人名索引", "文献一覧", "註", "注"):
-        return "大"
+
+    # 番号を持たない章（序章・終章など）と前付/後付。章扉ページ側の判定
+    # （chapter_title_page）は飾りの数字が紛れ込むと外れるので、文字列でも拾う。
+    #
+    # 章語と章題、後付の語と解説者名の間には必ず改行か空きが入る
+    # （「解説　佐藤太郎」「終章　親睦だけでもなんとかなる」）が、「終章に向けて」の
+    # ような句には入らない。正規化は CJK 隣接空白を落としてしまうので、この区別は
+    # 正規化前の先頭トークンでしか取れない。
+    # 正規化後の行全体でも照合するのは、逆に OCR が語の内側へ空白を入れることが
+    # あるため（「引用· 参考文献」「引用 参考文献」）。どちらも終端境界は課すので、
+    # 「解説佐藤太郎」のように語の直後で切れないものは昇格しない
+    first_token = normalize_text(re.split(r"[ \t　]", first_line, maxsplit=1)[0]).strip()
+    for candidate in (first_token, head):
+        if UNNUMBERED_CHAPTER_RE.match(candidate) or FRONT_BACK_RE.match(candidate):
+            return "大"
     if re.match(r"^\d+\s*[-‐−–—－]\s*\d+", head):
         return "中"
     return "小"
@@ -571,8 +696,8 @@ def build_ir(
         # --- 目次・索引など段組ページは幾何的に行を復元する ---
         if page_no in layout:
             flush()
-            for row in rows_of(page_lines, width):
-                if row in ("目次", "目 次", "事項索引", "人名索引", "索引"):
+            for row in rows_of(page_lines, width, height):
+                if row in ("目次", "事項索引", "人名索引", "索引"):
                     blocks.append({"kind": "heading", "level": "大", "lines": [row], "page": page_no})
                 else:
                     blocks.append({"kind": "raw", "text": row, "page": page_no})

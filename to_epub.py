@@ -22,7 +22,17 @@ import zipfile
 from pathlib import Path
 from xml.sax.saxutils import escape
 
-from book_ir import KANJI_RE, build_ir, crop_figures, fix_subtitle_dash, join_lines, normalize_text
+from book_ir import (
+    FRONT_BACK_WORDS,
+    KANJI_RE,
+    build_ir,
+    crop_figures,
+    fix_subtitle_dash,
+    front_back_re,
+    join_lines,
+    normalize_text,
+    strip_trailing_page_number,
+)
 
 # --------------------------------------------------------------------------
 # ルビ・インライン変換
@@ -154,7 +164,7 @@ def filter_printed_toc(blocks: list[dict], keep: bool = False) -> list[dict]:
     for b in blocks:
         if b["kind"] == "heading":
             head = normalize_text(b["lines"][0]) if b["lines"] else ""
-            skipping = head in ("目次", "目 次")
+            skipping = head == "目次"
             if skipping:
                 continue
         if skipping:
@@ -249,14 +259,12 @@ def apply_fixes(blocks: list[dict], fixes: list[dict]) -> list[dict]:
 
 BU_HEADING_RE = re.compile(r"^第[ⅠⅡⅢⅣⅤ]部")
 # book_ir.heading_level() は「大見出しかどうか」（＝章として XHTML を分割すべきか）を
-# 判定するためのものだが、ここでの FRONT_BACK_TITLES は「大見出しの中でも部に
-# ぶら下げず常に nav の第1階層に置くべきもの」を選ぶための別基準であり、意図的に
-# heading_level() の判定基準と非対称（例: 「註」は大見出しだが FRONT_BACK_TITLES には
-# 含めない＝現在の部の下にネストさせたい）。二つを揃える必要はない。
-FRONT_BACK_TITLES = {
-    "はじめに", "あとがき", "おわりに", "目次", "目 次",
-    "索引", "事項索引", "人名索引", "文献一覧",
-}
+# 判定するためのものだが、ここでの判定は「大見出しの中でも部にぶら下げず常に nav の
+# 第1階層に置くべきものか」という別基準であり、意図的に非対称。
+# その非対称は共有語彙からの差集合で表す: 註・注は大見出しだが、直前の部の内容に
+# 属する後注なので現在の部の下へネストさせたい。それ以外の前付/後付は部から独立させる。
+NESTED_BACK_WORDS = ("註", "注")
+FRONT_BACK_TITLE_RE = front_back_re(w for w in FRONT_BACK_WORDS if w not in NESTED_BACK_WORDS)
 
 
 def heading_title(lines: list[str]) -> str:
@@ -264,9 +272,12 @@ def heading_title(lines: list[str]) -> str:
 
     ダーシュで始まる副題行（fix_subtitle_dash が付与したもの）の前には全角空白を
     挟まない（「……時間――観点による区別」のように直接続ける）。
+
+    heading_level() は柱として除去しきれなかったページ番号ごと見出しを拾う
+    （「あとがき203」）ので、表示に回す前にその番号を落とす。
     """
 
-    parts = [normalize_text(l) for l in lines]
+    parts = [strip_trailing_page_number(normalize_text(l)) for l in lines]
     parts = [p for p in parts if p]
     parts = fix_subtitle_dash(parts)
     out = ""
@@ -324,7 +335,7 @@ def split_chapters_and_nav(blocks: list[dict]) -> tuple[list[dict], list[dict]]:
                 current_chapter["section_type"] = "part"
                 nav_tree.append(node)
                 current_bu = node
-            elif title in FRONT_BACK_TITLES:
+            elif FRONT_BACK_TITLE_RE.match(title):
                 nav_tree.append(node)
             elif current_bu is not None:
                 current_bu["children"].append(node)

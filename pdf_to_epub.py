@@ -28,7 +28,19 @@ import book_meta
 import ocr_book
 import to_aozora
 import to_epub
-from book_ir import DASHES, attach_ruby, build_ir, build_lines, normalize_text, parse_pages, rows_of
+from book_ir import (
+    DASHES,
+    FRONT_BACK_WORDS,
+    TOC_SELF_WORDS,
+    UNNUMBERED_CHAPTER_TOC_RE,
+    attach_ruby,
+    build_ir,
+    build_lines,
+    front_back_re,
+    normalize_text,
+    parse_pages,
+    rows_of,
+)
 from llm_proofread import chunk_cache_path, chunk_lines, run_chunk, validate
 
 
@@ -47,8 +59,23 @@ def load_json_or_die(path: Path) -> dict:
 BU_TOC_RE = re.compile(r"^第\s*([0-9０-９IVXⅠ-Ⅴ]{1,4})\s*部")
 CH_TOC_RE = re.compile(r"^第\s*([0-9０-９]{1,3})\s*章")
 COL_TOC_RE = re.compile(r"^Column\s*\d+", re.IGNORECASE)
+# 番号を持たない大見出し。序章・終章のような特殊な章と、前付/後付
+# （はじめに・あとがき・参考文献など）を指す。これらを目次エントリとして拾えないと、
+# その範囲が章プランに入らず、本文 OCR も校正も行われないまま EPUB から丸ごと落ちる。
+# 語彙は book_ir と共有し、本文側の heading_level() と判定基準を揃える。
+#
+# ただし「目次」だけは差し引く。印刷目次ページ自身の見出し行「目次」を拾うと、
+# ページ番号を持たないエントリとして extract_toc_entries() の pending に積まれ、
+# 縦組みで本文と分離したページ番号が 1 つずつずれて割り当てられ、全章の範囲が狂う。
+#
+# 「解説佐藤太郎250」のように語と続きの間の空きが正規化で消えた目次行は拾えない。
+# heading_level() は正規化前の先頭トークンで救えるが、ここに届く行は rows_of() が
+# 正規化済みなので同じ手が使えない。本文側が「解説　佐藤太郎」を大見出しと判定して
+# 章分割と nav は成立し、失うのは目次エントリだけで本文の欠落は起きないため受容する。
+FRONT_BACK_TOC_RE = front_back_re(w for w in FRONT_BACK_WORDS if w not in TOC_SELF_WORDS)
 TRAILING_DIGITS_RE = re.compile(r"(\d+)\s*$")
 TRAILING_ROMAN_RE = re.compile(r"([ivxlcIVXLC]{1,6})\s*$")
+NUM_ONLY_RE = re.compile(r"^[\d\s]+$")
 
 
 def roman_to_int(s: str) -> int | None:
@@ -76,17 +103,32 @@ def parse_toc_row(row: str) -> dict | None:
     row = row.strip()
     if not row:
         return None
-    m_bu, m_ch, m_col = BU_TOC_RE.match(row), CH_TOC_RE.match(row), COL_TOC_RE.match(row)
-    if not (m_bu or m_ch or m_col):
+    m_bu = BU_TOC_RE.match(row)
+    if not (
+        m_bu
+        or CH_TOC_RE.match(row)
+        or COL_TOC_RE.match(row)
+        or UNNUMBERED_CHAPTER_TOC_RE.match(row)
+        or FRONT_BACK_TOC_RE.match(row)
+    ):
         return None
     level = "部" if m_bu else "大"
 
     m_page = TRAILING_DIGITS_RE.search(row)
     if m_page:
-        return {"level": level, "title": row, "page_num": int(m_page.group(1)), "is_roman": False}
+        # 見出しとページ番号は同じ行に連結されて届く（「第1章町内会は必要です！29」）。
+        # 章の同定にも --toc-fix の照合にも番号は邪魔なので、タイトルからは落とす
+        title = row[: m_page.start(1)].strip()
+        return {"level": level, "title": title or row, "page_num": int(m_page.group(1)), "is_roman": False}
     m_roman = TRAILING_ROMAN_RE.search(row)
     if m_roman:
-        return {"level": level, "title": row, "page_num": roman_to_int(m_roman.group(1)), "is_roman": True}
+        title = row[: m_roman.start(1)].strip()
+        return {
+            "level": level,
+            "title": title or row,
+            "page_num": roman_to_int(m_roman.group(1)),
+            "is_roman": True,
+        }
     return {"level": level, "title": row, "page_num": None, "is_roman": False}
 
 
@@ -95,30 +137,41 @@ def extract_toc_entries(json_dir: Path, toc_pages: str) -> list[dict]:
 
     タイトルが長くて折り返された場合、ページ番号は続きの行（「――観点による区別73」
     のような副題＋ページ番号の行）にしか現れないことが多い。そこで、ページ番号が
-    取れなかった直近のエントリを覚えておき、後続の非見出し行から数字が拾えたら
-    そこで補完する。
+    取れなかったエントリを古い順に覚えておき、後続の行から数字が拾えたら順に補完する。
+
+    縦組みの目次では、ページ番号の縦中横だけが見出しと別の帯に落ちて「193」「250 243」
+    のような数字だけの行になることがある。目次のページ番号は必ず昇順なので、行内に
+    複数あるときは昇順に並べ直してから、待たせてあるエントリへ先頭から割り当てる。
     """
 
     entries: list[dict] = []
-    pending_idx: int | None = None
+    pending: list[int] = []
     for page_no in sorted(parse_pages(toc_pages)):
         path = json_dir / f"p{page_no:04d}.json"
         if not path.exists():
             raise SystemExit(f"目次ページ p{page_no} の OCR JSON がありません: {path}")
         data = load_json_or_die(path)
         lines = attach_ruby(build_lines(data["words"]))
-        for row in rows_of(lines, data["image_size"]["w"]):
+        for row in rows_of(lines, data["image_size"]["w"], data["image_size"]["h"]):
             entry = parse_toc_row(row)
             if entry:
                 entries.append(entry)
-                pending_idx = len(entries) - 1 if entry["page_num"] is None else None
+                if entry["page_num"] is None:
+                    pending.append(len(entries) - 1)
                 continue
-            if pending_idx is not None:
+            if not pending:
+                continue
+            if NUM_ONLY_RE.match(row):
+                nums = sorted(int(n) for n in re.findall(r"\d+", row))
+            else:
                 m_page = TRAILING_DIGITS_RE.search(row)
-                if m_page:
-                    entries[pending_idx]["page_num"] = int(m_page.group(1))
-                    entries[pending_idx]["is_roman"] = False
-                    pending_idx = None
+                nums = [int(m_page.group(1))] if m_page else []
+            for num in nums:
+                if not pending:
+                    break
+                idx = pending.pop(0)
+                entries[idx]["page_num"] = num
+                entries[idx]["is_roman"] = False
     return entries
 
 
@@ -241,13 +294,70 @@ def resolve_offset(
 # --------------------------------------------------------------------------
 
 
+def apply_toc_fixes(entries: list[dict], spec: str | None) -> list[dict]:
+    """目次エントリのページ番号を手で上書きする（--toc-fix）。
+
+    目次のページ番号は級数が小さく縦中横で組まれることも多いため、本文より OCR を
+    誤りやすい。誤読のまま進むと章の範囲が丸ごとずれるので、「第3章=81」のように
+    見出しの先頭一致で正しい書籍ページ番号を与えられるようにする。
+    """
+
+    if not spec:
+        return entries
+    for item in spec.split(","):
+        key, _, value = item.partition("=")
+        key, value = key.strip(), value.strip()
+        if not key or not value.isdigit():
+            raise SystemExit(f"--toc-fix の書式が不正です: {item!r}（例: 第3章=81）")
+        needle = normalize_text(key).replace(" ", "")
+        hit = [e for e in entries if normalize_text(e["title"]).replace(" ", "").startswith(needle)]
+        if len(hit) != 1:
+            raise SystemExit(
+                f"--toc-fix の {key!r} が目次エントリ {len(hit)} 件に一致しました（1 件である必要があります）"
+            )
+        print(f"目次を補正: {hit[0]['title']!r} page={hit[0]['page_num']} → {value}", flush=True)
+        hit[0]["page_num"] = int(value)
+        hit[0]["is_roman"] = False
+    return entries
+
+
+def uncovered_pages(
+    plan: list[dict], n_pdf_pages: int, skip_spec: str, toc_pages: set[int]
+) -> list[int]:
+    """章プランがどの章にも入れなかったページを返す。
+
+    目次の先頭エントリを取りこぼすと、それより前のページはどの章にも属さないまま
+    本文 OCR も校正もされず EPUB から丸ごと落ちる（途中や末尾の取りこぼしは直前の章に
+    吸収されるので欠落しない）。黙って消えるのが一番まずいので、呼び出し側で警告する。
+
+    目次ページは手順 1 で先に OCR してあり EPUB にも入るので、章プランの外にあっても
+    欠落ではない。--skip-pages ともども対象から外す。
+    """
+
+    pages = set(range(1, n_pdf_pages + 1)) - parse_pages(skip_spec) - toc_pages
+    for c in plan:
+        pages -= set(range(c["start"], c["end"] + 1))
+    return sorted(pages)
+
+
 def build_chapter_plan(entries: list[dict], offset: int, n_pdf_pages: int) -> list[dict]:
     """目次の部/大見出しエントリから章ごとの PDF ページ範囲を確定する"""
 
-    chapters = sorted(
-        (e for e in entries if e["page_num"] is not None and not e["is_roman"]),
-        key=lambda e: e["page_num"],
-    )
+    listed = [e for e in entries if e["page_num"] is not None and not e["is_roman"]]
+    chapters = sorted(listed, key=lambda e: e["page_num"])
+    # 目次に並んだ順とページ番号の昇順は一致するはず。食い違うのはページ番号の
+    # OCR 誤読なので、黙って章の範囲を作らず落とす（--toc-fix で補正できる）
+    if [e["page_num"] for e in listed] != [e["page_num"] for e in chapters]:
+        broken = [
+            f"{cur['title']!r}(page={cur['page_num']})"
+            for prev, cur in zip(listed, listed[1:])
+            if cur["page_num"] <= prev["page_num"]
+        ]
+        raise SystemExit(
+            "目次のページ番号が並び順と矛盾しています（OCR 誤読の可能性）: "
+            + " / ".join(broken)
+            + "\n正しい書籍ページ番号を --toc-fix \"第3章=81\" のように指定してください。"
+        )
     plan = []
     for i, e in enumerate(chapters):
         start = e["page_num"] + offset
@@ -373,6 +483,7 @@ def run(args):
 
     # 2. 目次パース
     entries = extract_toc_entries(json_dir, args.toc_pages)
+    entries = apply_toc_fixes(entries, args.toc_fix)
     print(f"\n目次エントリ: {len(entries)} 件", flush=True)
     for e in entries:
         tag = "roman" if e["is_roman"] else "arabic"
@@ -389,6 +500,19 @@ def run(args):
     print(f"\n章境界: {len(plan)} 章（オフセット {offset}）", flush=True)
     for i, c in enumerate(plan):
         print(f"  [{i}][{c['level']}] {c['title']!r}: PDF p{c['start']}〜p{c['end']} ({c['end'] - c['start'] + 1} ページ)", flush=True)
+
+    uncovered = uncovered_pages(plan, n_pages, args.skip_pages, set(toc_pages))
+    if uncovered:
+        print(
+            f"\n警告: どの章にも入らないページが {len(uncovered)} 件あります: "
+            + ", ".join(f"p{p}" for p in uncovered)
+            + "\n  これらは本文 OCR も校正もされず EPUB から落ちます。原因は目次エントリの"
+            "取りこぼし、ページオフセットのずれ、または前付のページ番号がローマ数字で"
+            "章プランに入らないことです。"
+            "\n  --toc-fix でページ番号を補うか --page-offset を見直してください"
+            "（ローマ数字の前付は --toc-fix で算用数字のページ番号を与えると章になります）。",
+            flush=True,
+        )
 
     if args.dry_run:
         print("\n--dry-run のため、本文 OCR・LLM 校正・EPUB 生成はスキップしました。", flush=True)
@@ -532,6 +656,11 @@ def main():
 
     parser.add_argument("--toc-pages", required=True, help="目次のページ範囲（例: 2-3）")
     parser.add_argument("--page-offset", type=int, default=None, help="書籍ページ番号+offset=PDFページ番号")
+    parser.add_argument(
+        "--toc-fix",
+        default="",
+        help="目次のページ番号を上書きする（誤読の補正。例: '第3章=81,第5章=150'）",
+    )
     parser.add_argument("--layout-pages", default="", help="段組を幾何的に復元するページ（目次・索引など）")
     parser.add_argument("--skip-pages", default="", help="出力しないページ（表紙・奥付など）")
 
