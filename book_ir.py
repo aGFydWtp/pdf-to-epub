@@ -65,6 +65,46 @@ def normalize_text(s: str) -> str:
     return s.strip()
 
 
+# 行またぎで割れた語を見分けるための、行末・行頭の英数字トークン。
+# 前後が和文であることを lookbehind/lookahead で必須にしている（欧文の語間と区別する）。
+SPLIT_TAIL_RE = re.compile(f"(?<=[{CJK}])([0-9A-Za-z]+)$")
+SPLIT_HEAD_RE = re.compile(f"^([0-9A-Za-z]+)(?=[{CJK}])")
+
+
+def is_split_token(left: str, right: str) -> bool:
+    """行末と次行頭が 1 つの語を割ったものか判定する（空白で繋いではいけない形）。
+
+    版面は語の途中でも改行するので、行末と次行頭が英数字というだけで空白を入れると
+    語が割れる（'…大きく、20' + '15年から…' → '20 15年'）。かといって空白を一律に
+    やめると、行をまたぐ欧文の語間（'…研究所 The Institute' + 'for Policy…'）が
+    潰れる。そこで、和文に挟まれていること（＝日本語の本文中に置かれた数字・略語で
+    あること）を必須にしたうえで、3 冊のコーパスで確認できた 2 形だけを拾う。
+
+      - 数字どうし          '…、20' + '15年から…'  → 2015年
+      - 片方が単独の大文字   '…やUA' + 'Eなど…'    → UAE
+
+    単独の大文字 1 文字は、OCR が語を割ったときにしか現れない（to_epub の UPRIGHT_RE と
+    同じ実測に基づく）。この条件を外すと『THE』+『MODEL』のような正当な欧文の語間まで
+    潰れる（『レベニューオペレーション(RevOps)の教科書』p91 で実在）。
+    和文に挟まれる条件のほうは、図表を段落として拾ってしまったページの数値の並び
+    （'70' + '60' + '50' …）や、索引の「見出し語＋ページ番号」を守っている。
+    """
+
+    m_left, m_right = SPLIT_TAIL_RE.search(left), SPLIT_HEAD_RE.match(right)
+    if not m_left or not m_right:
+        return False
+    tail, head = m_left.group(1), m_right.group(1)
+    if tail.isdigit() and head.isdigit():
+        return True
+    return (
+        tail.isalpha()
+        and head.isalpha()
+        and tail.isupper()
+        and head.isupper()
+        and min(len(tail), len(head)) == 1
+    )
+
+
 def join_lines(lines: list[str]) -> str:
     """折り返された行を 1 行に連結する（欧文どうしのみ空白で繋ぐ）"""
 
@@ -73,7 +113,12 @@ def join_lines(lines: list[str]) -> str:
         line = line.strip()
         if not line:
             continue
-        if out and re.search(r"[0-9A-Za-z]$", out) and re.match(r"[0-9A-Za-z]", line):
+        if (
+            out
+            and re.search(r"[0-9A-Za-z]$", out)
+            and re.match(r"[0-9A-Za-z]", line)
+            and not is_split_token(out, line)
+        ):
             out += " "
         out += line
     return out
