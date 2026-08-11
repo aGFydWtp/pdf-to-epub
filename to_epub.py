@@ -13,6 +13,7 @@
 import argparse
 import datetime
 import io
+import posixpath
 import re
 import sys
 import tempfile
@@ -376,7 +377,23 @@ BU_HEADING_RE = re.compile(r"^第[ⅠⅡⅢⅣⅤ]部")
 # 第1階層に置くべきものか」という別基準であり、意図的に非対称。
 # その非対称は共有語彙からの差集合で表す: 註・注は大見出しだが、直前の部の内容に
 # 属する後注なので現在の部の下へネストさせたい。それ以外の前付/後付は部から独立させる。
-NESTED_BACK_WORDS = ("註", "注")
+#
+# 文献リストと謝辞も同じ理由でネストさせる。『時間を哲学する』は各章の末尾に
+# 「註」「参考文献」を、第Ⅱ部の章末に「謝辞」を置く体裁で、これらを第1階層へ出すと
+# nav が「部 → 部の子を全部 → 章末の参考文献」の順に並び、spine 順と食い違って
+# epubcheck WARNING(NAV-011) になる（実測 3 件: ch005 / ch022 / ch035。ch022 は謝辞）。
+# 文献リストは表記ゆれを持つ語をまとめて入れる。章末に置かれうるかどうかで語ごとに
+# 線を引くと、同じ本でも OCR の読みの揺れ（「参考文献」/「参考文献一覧」）だけで
+# 階層が変わってしまうため。「初出一覧」は章末に置かれる体裁を実データで見ていないので
+# 入れない。
+# トレードオフ: 巻末に独立した参考文献・謝辞を持つ本では、それが第1階層ではなく最終の
+# 部の子になる。階層は 1 段深くなるが順序は正しいので NAV-011 は出ない。
+# 順序破壊を検出する汎用ロジックは作らない（複雑さに見合わない）。
+NESTED_BACK_WORDS = (
+    "註", "注",
+    "引用・参考文献", "引用参考文献", "参考文献一覧", "参考文献", "文献一覧", "参考図書",
+    "謝辞",
+)
 FRONT_BACK_TITLE_RE = front_back_re(w for w in FRONT_BACK_WORDS if w not in NESTED_BACK_WORDS)
 
 
@@ -401,6 +418,80 @@ def heading_title(lines: list[str]) -> str:
     return out
 
 
+# 部扉ページと認めてよい「同一ページの本文 para の総字数」の上限。
+# 実測（『時間を哲学する』の ocr_json）:
+#   本物の部扉 p13 / p103 / p252 … 同一ページの para は 0 ブロック・0 字
+#   「はじめに」の中で部構成を説明しているだけの偽の部見出し p9 / p10
+#                          … 同一ページの para は 11 / 6 ブロック・650 / 617 字
+#   この本でいちばん薄い本文ページでも 434 字
+# 0 と 434 のあいだで、扉に短いリード文や著者名が乗っていても扉と認められる値として
+# 100 字を採る（p13 の「平井靖史」のような扉の添え物は kind=raw で para には入らない）。
+PART_TITLE_PAGE_MAX_CHARS = 100
+
+
+def _page_para_chars(blocks: list[dict]) -> dict[int, int]:
+    """ページ番号 → そのページの本文 para の総字数"""
+
+    chars: dict[int, int] = {}
+    for b in blocks:
+        if b["kind"] != "para":
+            continue
+        page = b.get("page")
+        if page is None:
+            continue
+        chars[page] = chars.get(page, 0) + sum(len(l) for l in b.get("lines", ()))
+    return chars
+
+
+def demote_false_part_headings(blocks: list[dict]) -> list[dict]:
+    """本文の中に紛れた偽の部見出しを para へ降格する（章を分割する前に通す）。
+
+    前書きが「第Ⅰ部では〜、第Ⅱ部では〜」と部構成を説明していると、その行が部見出しと
+    して立ってしまう。大見出しは章ファイルを切るので、これは nav の見た目だけの問題では
+    なく、前書きの本文後半が別の章ファイルへ吸い込まれる。nav の後処理では直せないので
+    split の前に潰す。降格であって削除ではない（本文はそのまま前の章に残る）。
+
+    判定は「本物の部扉はそのページに本文がほとんど無い」という版面の性質による。
+    その本に本物の部扉が 1 つでもあることを条件にしてから、本文の乗ったページの部見出し
+    だけを降格する。部扉を立てず本文の頭に部名を置く体裁の本では条件が成立せず、何もし
+    ない（判断材料が無いので触らない）。
+
+    部番号でグループ化しないのは、番号そのものが OCR のいちばん外しやすい部分だから。
+    実測では PDF のテキスト層が無いと book_ir.fix_bu_numerals() が働かず、
+    『時間を哲学する』の p103（第Ⅱ部）と p252（第Ⅲ部）が両方とも「第Ⅰ部」と読まれる。
+    番号を鍵にすると、その本では第Ⅱ部のグループが偽の見出し 1 件だけになり降格できない。
+    """
+
+    para_chars = _page_para_chars(blocks)
+    bu_pages: list[tuple[int, int]] = []  # (blocks の index, ページの本文字数)
+    for i, b in enumerate(blocks):
+        if b["kind"] != "heading" or b["level"] != "大" or b.get("page") is None:
+            continue
+        if BU_HEADING_RE.match(heading_title(b["lines"])):
+            bu_pages.append((i, para_chars.get(b["page"], 0)))
+
+    if len(bu_pages) < 2:
+        return blocks
+    if not any(chars <= PART_TITLE_PAGE_MAX_CHARS for _, chars in bu_pages):
+        return blocks
+
+    demoted = {i for i, chars in bu_pages if chars > PART_TITLE_PAGE_MAX_CHARS}
+    if not demoted:
+        return blocks
+
+    out = []
+    for i, b in enumerate(blocks):
+        if i in demoted:
+            b = {k: v for k, v in b.items() if k != "level"}
+            b["kind"] = "para"
+            print(
+                f"  偽の部見出しを本文へ降格: p{b.get('page')} "
+                f"{heading_title(blocks[i]['lines'])[:40]!r}"
+            )
+        out.append(b)
+    return out
+
+
 def split_chapters_and_nav(blocks: list[dict]) -> tuple[list[dict], list[dict]]:
     """IR を大見出しごとの章に分割し、同時に階層目次ツリーを構築する。
 
@@ -409,6 +500,7 @@ def split_chapters_and_nav(blocks: list[dict]) -> tuple[list[dict], list[dict]]:
     - はじめに・あとがき・目次・索引など前付/後付の大見出しは常に第1階層
     - 中見出しは現在の章の nav ノードの子（第3階層）として登録し、id を振る
     - 小見出しは id のみ振り、nav には含めない
+    - 直前の大見出しとタイトルが同じ大見出しは章を切らずに統合する
 
     戻り値: (chapters, nav_tree)
       chapters: [{"file": "ch000.xhtml", "blocks": [...], "section_type": "part"|"chapter"}]
@@ -420,6 +512,7 @@ def split_chapters_and_nav(blocks: list[dict]) -> tuple[list[dict], list[dict]]:
     current_bu: dict | None = None
     current_chapter_nav: dict | None = None
     current_chapter: dict | None = None
+    last_major_title: str | None = None
     heading_seq = 0
 
     def ensure_chapter() -> dict:
@@ -435,14 +528,23 @@ def split_chapters_and_nav(blocks: list[dict]) -> tuple[list[dict], list[dict]]:
 
     for b in blocks:
         if b["kind"] == "heading" and b["level"] == "大":
+            title = heading_title(b["lines"])
+            # 索引のようにページごとの柱が大見出しへ昇格する本では、同じタイトルの大見出しが
+            # 連続して章がページ単位に割れる（実測『時間を哲学する』: 事項索引 4 章・人名索引
+            # 2 章）。直前の大見出しとタイトルが同じなら章も nav ノードも増やさず、重複した
+            # 見出しブロックだけを捨てて直前の章に統合する。捨てるのは見出しブロックだけで、
+            # 後続の本文ブロックはそのまま直前の章へ入る。
+            if title and title == last_major_title and current_chapter is not None:
+                continue
+
             current_chapter = {
                 "file": f"ch{len(chapters):03d}.xhtml",
                 "blocks": [b],
                 "section_type": "chapter",
             }
             chapters.append(current_chapter)
+            last_major_title = title
 
-            title = heading_title(b["lines"])
             node = {"title": title or "（無題）", "href": f"text/{current_chapter['file']}", "children": []}
             if BU_HEADING_RE.match(title):
                 current_chapter["section_type"] = "part"
@@ -972,6 +1074,57 @@ def render_cover_png(pdf_path: Path, page_no: int, dpi: int) -> bytes:
 # --------------------------------------------------------------------------
 
 
+XHTML_NS = "{http://www.w3.org/1999/xhtml}"
+EPUB_OPS_NS = "{http://www.idpf.org/2007/ops}"
+
+
+def nav_order_problems(nav_xml: str, nav_href: str, spine_order: dict[str, int]) -> list[str]:
+    """toc nav のリンク出現順が spine 順と一致しているかを見る（epubcheck の NAV-011 相当）。
+
+    nav は「第1階層の要素 → その children」の順に描画されるので、部の途中に現れた章末の
+    後付（参考文献・謝辞など）を第1階層へ上げると、部の子をすべて出し終えてからその章が
+    現れることになり閲覧順と食い違う。epubcheck では警告どまりで self-check も素通りして
+    いたため、37 項目まで崩れて初めて気づいた。その回帰検査。
+
+    nav_href / spine_order のキーは package.opf から見た相対パス（manifest の href）。
+    landmarks など toc 以外の nav は対象にしない（cover や nav 自身を指すので順序が違って
+    当然）。同じ章ファイルへの複数リンク（中見出しのフラグメント）は同じ位置とみなす。
+    """
+
+    try:
+        root = ET.fromstring(nav_xml)
+    except ET.ParseError as e:
+        return [f"nav.xhtml を解析できません: {e}"]
+
+    toc = None
+    for nav in root.iter(f"{XHTML_NS}nav"):
+        if nav.get(f"{EPUB_OPS_NS}type") == "toc":
+            toc = nav
+            break
+    if toc is None:
+        return ['nav.xhtml に epub:type="toc" の nav がありません']
+
+    base = posixpath.dirname(nav_href)
+    problems: list[str] = []
+    prev_pos, prev_href = -1, ""
+    for a in toc.iter(f"{XHTML_NS}a"):
+        href = (a.get("href") or "").split("#")[0]
+        if not href:
+            continue
+        target = posixpath.normpath(posixpath.join(base, href))
+        pos = spine_order.get(target)
+        if pos is None:
+            # spine に無いものを指すリンク（表紙など）は閲覧順の比較対象にしない
+            continue
+        if pos < prev_pos:
+            problems.append(
+                f"nav の順序が spine 順と食い違っています: {target}（spine {pos} 番目）が "
+                f"{prev_href}（spine {prev_pos} 番目）より後に並んでいます"
+            )
+        prev_pos, prev_href = pos, target
+    return problems
+
+
 def self_check(epub_path: Path, horizontal: bool = False) -> list[str]:
     """生成した EPUB を zip 構造・XML 整形式・manifest/spine 突合・縦横整合の観点で検証する
 
@@ -1023,10 +1176,26 @@ def self_check(epub_path: Path, horizontal: bool = False) -> list[str]:
         if spine is None:
             problems.append("package.opf に spine がありません")
             return problems
-        for itemref in spine:
+        spine_order: dict[str, int] = {}
+        for pos, itemref in enumerate(spine):
             idref = itemref.get("idref")
             if idref not in manifest_items:
                 problems.append(f"spine の idref が manifest にありません: {idref}")
+                continue
+            spine_order.setdefault(manifest_items[idref], pos)
+
+        # --- nav.xhtml の閲覧順（NAV-011 相当）---
+        nav_hrefs = [
+            item.get("href")
+            for item in root.find("opf:manifest", ns)
+            if "nav" in (item.get("properties") or "").split()
+        ]
+        for nav_href in nav_hrefs:
+            nav_full = f"{opf_dir}/{nav_href}" if opf_dir not in ("", ".") else nav_href
+            if nav_full in names:
+                problems += nav_order_problems(
+                    zf.read(nav_full).decode("utf-8"), nav_href, spine_order
+                )
 
         # --- NCX（EPUB2 互換）---
         # NCX を manifest に入れたら spine の toc 属性で指す必要があり（無いと RSC-005）、
@@ -1163,6 +1332,7 @@ def build_epub(
             raise SystemExit(f"校正 fixes の読み込みに失敗しました: {fixes_path}: {e}") from e
         blocks = apply_fixes(blocks, fixes)
 
+    blocks = demote_false_part_headings(blocks)
     chapters, nav_tree = split_chapters_and_nav(blocks)
     orphans = chapters_without_nav_entry(chapters)
     if orphans:

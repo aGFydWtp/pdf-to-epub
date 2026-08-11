@@ -382,9 +382,38 @@ epubcheck "書名.epub"
 
 `build_epub()` が毎回自動実行する。zip 構造・XML 整形式・manifest/spine 突合に加え、
 縦横整合（CSS の `writing-mode` / `page-progression-direction` / `primary-writing-mode`）
-と NCX 整合（manifest 登録・spine の `toc` 属性・`dtb:uid` と `dc:identifier` の一致）
-を検証する。NCX の2項目は epubcheck の `RSC-005` / `NCX-001` に対応しており、
-epubcheck を回す前にローカルで同じ退行を捕まえられる。FAIL 時は `sys.exit(1)`。
+と NCX 整合（manifest 登録・spine の `toc` 属性・`dtb:uid` と `dc:identifier` の一致）、
+nav の閲覧順（`nav_order_problems()`）を検証する。NCX の2項目は epubcheck の
+`RSC-005` / `NCX-001` に、nav の閲覧順は `NAV-011` に対応しており、epubcheck を回す前に
+ローカルで同じ退行を捕まえられる。FAIL 時は `sys.exit(1)`。
+
+---
+
+## nav の構造（`to_epub.split_chapters_and_nav` 周辺）
+
+『時間を哲学する』（慶應義塾大学出版会）で nav 第1階層が 37 項目まで膨らみ、
+epubcheck `WARNING(NAV-011)`（"toc" nav は閲覧順でなければなりません）が 3 件出た。
+原因は 3 つあり、いずれも `to_epub.py` 側で閉じている（`book_ir.FRONT_BACK_WORDS` は
+校正チャンクのキャッシュキーに効くので触らない。差集合を取る側だけを変える）。
+
+1. **章末の後付が部を飛び越えて第1階層へ上がる** → `NESTED_BACK_WORDS` に文献リスト系
+   （`引用・参考文献` `引用参考文献` `参考文献一覧` `参考文献` `文献一覧` `参考図書`）と
+   `謝辞` を追加し、部の子へネストさせる。nav は「第1階層 → その children」の順に描画
+   されるので、部の途中の章末後付を第1階層へ出すと部の子を出し切ってから現れて
+   閲覧順が崩れる。トレードオフ: 巻末の独立した参考文献・謝辞は最終の部の子になる
+   （階層が 1 段深くなるが順序は正しい）。
+2. **索引がページ単位で章に割れる** → `split_chapters_and_nav()` は直前の大見出しと
+   タイトルが同じ大見出しでは章も nav ノードも増やさず、重複した見出しブロックだけを
+   捨てる。**本文ブロックは 1 つも落とさない**（実測『時間を哲学する』: 消えるのは
+   重複見出し 10 ブロックのみ、非見出しブロックの欠落 0）。
+3. **前書き中の部構成の説明文が部見出しとして立ち、本文を吸い込む** →
+   `demote_false_part_headings()` を split の**前**に通して para へ降格する。大見出しは
+   章ファイルを切るので nav の後処理では直らない。判定は「本物の部扉はそのページに
+   本文がほとんど無い」という版面の性質による（`PART_TITLE_PAGE_MAX_CHARS = 100` 字。
+   実測: 本物の扉 0 字 / 偽の見出し 650・617 字 / いちばん薄い本文ページ 434 字）。
+   本物の扉がその本に 1 つも無ければ何もしない。
+   部番号でグループ化しないのは、番号が OCR のいちばん外しやすい部分だから
+   （PDF テキスト層が無いと `book_ir.fix_bu_numerals()` が働かず Ⅱ・Ⅲ が Ⅰ に化ける）。
 
 ---
 
