@@ -6,6 +6,9 @@ nav 第1階層が 37 項目まで膨らみ、epubcheck WARNING(NAV-011) が 3 �
 実測値で、推測値は使っていない。
 
 入力は normalize_text() を通した文字列で書く（docs/HANDOFF.md の house rule）。
+見出しの字間に全角空白を置かないのはそのため（normalize_text() は CJK 間の空白を落とす
+ので「第Ⅰ部　総論」は不動点ではない）。demote_false_part_headings() の字数計算のように
+正規化を通さない関数へ同じフィクスチャを流しても差分が出ないようにしてある。
 """
 
 import sys
@@ -14,6 +17,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from book_ir import normalize_text  # noqa: E402
 from to_epub import (  # noqa: E402
     PART_TITLE_PAGE_MAX_CHARS,
     build_css,
@@ -35,6 +39,22 @@ def para(text: str, page: int = 1) -> dict:
     return {"kind": "para", "lines": [text], "page": page}
 
 
+def test_fixtures_are_already_normalized():
+    """house rule の番人。全角空白入りの見出しを書くと normalize_text() の不動点でなくなる
+
+    heading_title() は内部で正規化し直すので見出しの比較では差が出ないが、
+    demote_false_part_headings() の字数計算は生テキストを数えるので、
+    正規化前の文字列を混ぜると本番と違う長さでテストしてしまう。
+    """
+
+    for line in Path(__file__).read_text(encoding="utf-8").splitlines():
+        stripped = line.lstrip()
+        if stripped.startswith(("heading(", "para(")):
+            assert "　" not in line, f"フィクスチャに全角空白が入っています: {stripped}"
+    for s in ("第Ⅰ部概念のツールボックス", "第1章主観的時間、客観的時間", "アリストテレス12"):
+        assert normalize_text(s) == s
+
+
 # --------------------------------------------------------------------------
 # 問題1: 章末の後付が部を飛び越えて第1階層へ上がる（NAV-011 の原因）
 # --------------------------------------------------------------------------
@@ -48,11 +68,11 @@ def test_chapter_end_back_matter_nests_under_the_part():
     """
 
     blocks = [
-        heading("第Ⅰ部　概念のツールボックス"),
-        heading("第1章　主観的時間、客観的時間"),
+        heading("第Ⅰ部概念のツールボックス"),
+        heading("第1章主観的時間、客観的時間"),
         heading("註"),
         heading("参考文献"),
-        heading("第2章　物理の時間、生物の時間"),
+        heading("第2章物理の時間、生物の時間"),
         heading("謝辞"),
         heading("参考文献"),
     ]
@@ -75,11 +95,11 @@ def test_nav_order_matches_spine_order_for_a_book_with_parts():
 
     blocks = [
         heading("はじめに"),
-        heading("第Ⅰ部　概念のツールボックス"),
-        heading("第1章　主観的時間、客観的時間"),
+        heading("第Ⅰ部概念のツールボックス"),
+        heading("第1章主観的時間、客観的時間"),
         heading("参考文献"),
-        heading("第Ⅱ部　実践編"),
-        heading("第1章　ベルクソンの時間論"),
+        heading("第Ⅱ部実践編"),
+        heading("第1章ベルクソンの時間論"),
         heading("謝辞"),
         heading("参考文献"),
         heading("事項索引"),
@@ -97,8 +117,8 @@ def test_notes_still_nest_under_the_part():
     """既存の挙動（註は部の子、解説など他の後付は第1階層）を変えない"""
 
     blocks = [
-        heading("第Ⅰ部　総論"),
-        heading("第1章　町内会は必要です！"),
+        heading("第Ⅰ部総論"),
+        heading("第1章町内会は必要です！"),
         heading("註"),
         heading("解説"),
         heading("訳者あとがき"),
@@ -114,8 +134,8 @@ def test_standalone_back_matter_bibliography_nests_under_the_last_part():
     """トレードオフの明示: 巻末の独立した参考文献は最終の部の子になる（順序は正しい）"""
 
     blocks = [
-        heading("第Ⅰ部　総論"),
-        heading("第1章　町内会は必要です！"),
+        heading("第Ⅰ部総論"),
+        heading("第1章町内会は必要です！"),
         heading("引用・参考文献"),
     ]
 
@@ -130,7 +150,7 @@ def test_back_matter_without_parts_stays_at_top_level():
 
     blocks = [
         heading("はじめに"),
-        heading("第1章　町内会って何？"),
+        heading("第1章町内会って何？"),
         heading("あとがき"),
         heading("引用・参考文献"),
     ]
@@ -158,13 +178,13 @@ def test_repeated_heading_merges_into_one_chapter_without_losing_body():
 
     blocks = [
         heading("事項索引", page=287),
-        para("アリストテレス　12", page=287),
+        para("アリストテレス12", page=287),
         heading("事項索引", page=288),
-        para("イデア　34", page=288),
+        para("イデア34", page=288),
         heading("事項索引", page=290),
-        para("運動　56", page=290),
+        para("運動56", page=290),
         heading("人名索引", page=293),
-        para("カント　78", page=293),
+        para("カント78", page=293),
     ]
 
     chapters, nav = split_chapters_and_nav(blocks)
@@ -173,21 +193,47 @@ def test_repeated_heading_merges_into_one_chapter_without_losing_body():
     assert len(chapters) == 2
     # 落とすのは重複した見出しブロックだけ。本文はすべて統合先の章に残る
     assert [b["lines"][0] for b in chapters[0]["blocks"] if b["kind"] == "para"] == [
-        "アリストテレス　12",
-        "イデア　34",
-        "運動　56",
+        "アリストテレス12",
+        "イデア34",
+        "運動56",
     ]
-    assert [b["lines"][0] for b in chapters[1]["blocks"] if b["kind"] == "para"] == ["カント　78"]
+    assert [b["lines"][0] for b in chapters[1]["blocks"] if b["kind"] == "para"] == ["カント78"]
     assert sum(1 for b in chapters[0]["blocks"] if b["kind"] == "heading") == 1
+
+
+def test_consecutive_same_title_headings_with_different_content_are_fused():
+    """既知の限界を固定する: 同名だが別内容の節が続くと 2 件目の見出しが消えて連結される
+
+    複数人の「解説」が続き、見出しブロックに執筆者名が入らなかった場合が該当する。
+    内容は失われないが節の切れ目は見えなくなる。統合ロジックを変えるときはここを読むこと。
+    """
+
+    blocks = [
+        heading("解説", page=280),
+        para("佐藤太郎による解説の本文", page=280),
+        heading("解説", page=284),
+        para("鈴木花子による解説の本文", page=284),
+    ]
+
+    chapters, nav = split_chapters_and_nav(blocks)
+
+    assert [n["title"] for n in nav] == ["解説"]
+    assert len(chapters) == 1
+    assert sum(1 for b in chapters[0]["blocks"] if b["kind"] == "heading") == 1
+    # 本文はどちらも残る（消えるのは 2 件目の見出しだけ）
+    assert [b["lines"][0] for b in chapters[0]["blocks"] if b["kind"] == "para"] == [
+        "佐藤太郎による解説の本文",
+        "鈴木花子による解説の本文",
+    ]
 
 
 def test_same_title_headings_apart_are_not_merged():
     """離れた位置の同名見出し（各章末の参考文献）は統合しない"""
 
     blocks = [
-        heading("第1章　主観的時間"),
+        heading("第1章主観的時間"),
         heading("参考文献"),
-        heading("第2章　物理の時間"),
+        heading("第2章物理の時間"),
         heading("参考文献"),
     ]
 
@@ -215,10 +261,13 @@ def test_merged_chapter_keeps_hosting_sub_headings():
 # 問題3: 前書き中の紹介文が部見出しとして誤検出され、本文を吸い込む
 # --------------------------------------------------------------------------
 
-# 実測: 偽の部見出しのページは本文 para が 650 字 / 617 字、本物の部扉は 0 字。
-# この本でいちばん薄い本文ページでも 434 字あるので、閾値 100 字は両者の間にある。
+# 実測（正規化前の生の OCR テキストで計測）: 偽の部見出しのページは本文 para が
+# 650 字 / 617 字、本物の部扉は 0 字。全 301 ページで para 0 字なのはその 3 つの部扉だけで、
+# 表紙 p1（10 字）を除けば次に薄いページは 118 字。閾値 100 字は 0 と 118 の間にある。
 BODY_PAGE_TEXT = "あ" * 650
 THIN_LEAD_TEXT = "あ" * 40
+# 扉に献辞やエピグラフを置く体裁。閾値は超えるが本文ページよりはるかに薄い
+LEAD_PAGE_TEXT = "あ" * 150
 
 
 def test_false_part_heading_in_the_preface_is_demoted_to_a_paragraph():
@@ -231,10 +280,10 @@ def test_false_part_heading_in_the_preface_is_demoted_to_a_paragraph():
     blocks = [
         heading("はじめに", page=4),
         para(BODY_PAGE_TEXT, page=9),
-        heading("第Ⅰ部　「概念のツールボックス」考えるための道具を揃える", page=9),
+        heading("第Ⅰ部「概念のツールボックス」考えるための道具を揃える", page=9),
         para(BODY_PAGE_TEXT, page=9),
-        heading("第Ⅰ部　概念のツールボックス", page=13),
-        heading("第1章　主観的時間、客観的時間", page=14),
+        heading("第Ⅰ部概念のツールボックス", page=13),
+        heading("第1章主観的時間、客観的時間", page=14),
         para(BODY_PAGE_TEXT, page=14),
     ]
 
@@ -255,11 +304,11 @@ def test_real_part_title_pages_survive():
     """本物の部扉（本文のほとんど無いページ）は部として残る"""
 
     blocks = [
-        heading("第Ⅰ部　概念のツールボックス", page=13),
-        para("第1章　主観的時間", page=14),
-        heading("第Ⅱ部　実践編", page=103),
+        heading("第Ⅰ部概念のツールボックス", page=13),
+        para("第1章主観的時間", page=14),
+        heading("第Ⅱ部実践編", page=103),
         para(BODY_PAGE_TEXT, page=104),
-        heading("第Ⅲ部　広げるためのコラム", page=252),
+        heading("第Ⅲ部広げるためのコラム", page=252),
     ]
 
     fixed = demote_false_part_headings(blocks)
@@ -271,9 +320,9 @@ def test_part_title_page_with_a_short_lead_survives():
     """扉に短いリード文が乗っていても閾値（100 字）以内なら扉として残す"""
 
     blocks = [
-        heading("第Ⅰ部　概念のツールボックス", page=13),
+        heading("第Ⅰ部概念のツールボックス", page=13),
         para(THIN_LEAD_TEXT, page=13),
-        heading("第Ⅱ部　実践編", page=103),
+        heading("第Ⅱ部実践編", page=103),
         para(BODY_PAGE_TEXT, page=104),
     ]
 
@@ -283,13 +332,75 @@ def test_part_title_page_with_a_short_lead_survives():
     ]
 
 
+def test_mixed_part_title_styles_do_not_demote_a_real_part_title_page():
+    """部番号が区別できていれば、他の部の扉の薄さを根拠に本物の扉を降格しない
+
+    扉に献辞やエピグラフを置く体裁（150 字）は珍しくない。本全体を 1 グループにすると
+    第Ⅰ部の 0 字が基準になって第Ⅱ部の扉が降格され、部構成が丸ごと壊れる。
+    """
+
+    blocks = [
+        heading("第Ⅰ部総論", page=13),
+        heading("第Ⅱ部実践編", page=103),
+        para(LEAD_PAGE_TEXT, page=103),
+        para(BODY_PAGE_TEXT, page=104),
+    ]
+
+    assert len(LEAD_PAGE_TEXT) > PART_TITLE_PAGE_MAX_CHARS
+    assert [b["kind"] for b in demote_false_part_headings(blocks)] == [
+        "heading", "heading", "para", "para",
+    ]
+
+
+def test_reliable_part_numbers_group_the_comparison_by_number():
+    """番号が区別できているときは同じ部番号どうしで比較する（本物の扉は無傷）"""
+
+    blocks = [
+        para(BODY_PAGE_TEXT, page=9),
+        heading("第Ⅰ部「概念のツールボックス」考えるための道具を揃える", page=9),
+        heading("第Ⅰ部概念のツールボックス", page=13),
+        heading("第Ⅱ部実践編", page=103),
+        para(LEAD_PAGE_TEXT, page=103),
+    ]
+
+    fixed = demote_false_part_headings(blocks)
+
+    # 第Ⅰ部の偽の見出しだけが降格し、扉に 150 字が乗った第Ⅱ部は残る
+    assert [b["kind"] for b in fixed] == ["para", "para", "heading", "heading", "para"]
+
+
+def test_collided_part_numbers_fall_back_to_a_whole_book_comparison():
+    """番号が潰れているときは本全体で比較する（実測: PDF テキスト層が無いと Ⅱ・Ⅲ が Ⅰ に化ける）
+
+    book_ir.fix_bu_numerals() は PDF の内蔵テキスト層と突き合わせて部番号を直すので、
+    PDF が手元に無いと『時間を哲学する』の p13 / p103 / p252 が全部「第Ⅰ部」になる。
+    番号を鍵にすると第Ⅱ部のグループが偽の見出し 1 件だけになり降格できない。
+    """
+
+    blocks = [
+        para(BODY_PAGE_TEXT, page=9),
+        heading("第Ⅰ部「概念のツールボックス」考えるための道具を揃える", page=9),
+        para(BODY_PAGE_TEXT, page=10),
+        heading("第Ⅱ部「実践編」哲学者たちの手さばきを見る", page=10),
+        heading("第Ⅰ部概念のツールボックス", page=13),
+        heading("第Ⅰ部実践編", page=103),
+        heading("第Ⅰ部広げるためのコラム", page=252),
+    ]
+
+    fixed = demote_false_part_headings(blocks)
+
+    assert [b["kind"] for b in fixed] == [
+        "para", "para", "para", "para", "heading", "heading", "heading",
+    ]
+
+
 def test_books_without_a_clean_part_title_page_are_left_alone():
     """部扉を立てず本文の頭に部名を置く体裁の本には触らない（判断材料が無い）"""
 
     blocks = [
-        heading("第Ⅰ部　概念のツールボックス", page=13),
+        heading("第Ⅰ部概念のツールボックス", page=13),
         para(BODY_PAGE_TEXT, page=13),
-        heading("第Ⅱ部　実践編", page=103),
+        heading("第Ⅱ部実践編", page=103),
         para(BODY_PAGE_TEXT, page=103),
     ]
 
@@ -302,7 +413,7 @@ def test_a_single_part_heading_is_never_demoted():
     """部見出しが 1 つしかなければ比較相手がいないので降格しない"""
 
     blocks = [
-        heading("第Ⅰ部　概念のツールボックス", page=9),
+        heading("第Ⅰ部概念のツールボックス", page=9),
         para(BODY_PAGE_TEXT, page=9),
         heading("はじめに", page=4),
         para(BODY_PAGE_TEXT, page=4),

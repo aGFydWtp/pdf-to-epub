@@ -419,18 +419,20 @@ def heading_title(lines: list[str]) -> str:
 
 
 # 部扉ページと認めてよい「同一ページの本文 para の総字数」の上限。
-# 実測（『時間を哲学する』の ocr_json）:
-#   本物の部扉 p13 / p103 / p252 … 同一ページの para は 0 ブロック・0 字
+# 字数は _page_para_chars() と同じく **normalize_text() を通す前の生の OCR テキスト**
+# で数えた実測値（『時間を哲学する』の ocr_json）:
+#   本物の部扉 p13 / p103 / p252 … para は 0 ブロック・生 0 字（正規化後も 0 字）
 #   「はじめに」の中で部構成を説明しているだけの偽の部見出し p9 / p10
-#                          … 同一ページの para は 11 / 6 ブロック・650 / 617 字
-#   この本でいちばん薄い本文ページでも 434 字
-# 0 と 434 のあいだで、扉に短いリード文や著者名が乗っていても扉と認められる値として
-# 100 字を採る（p13 の「平井靖史」のような扉の添え物は kind=raw で para には入らない）。
+#                          … para は 11 / 6 ブロック・生 650 / 617 字（正規化後 644 / 616 字）
+# 全 301 ページで para が 0 字なのはこの 3 つの部扉だけ。次に薄いのは表紙の p1（10 字）で、
+# それを除くと最小は p295 の 118 字。0 と 118 のあいだで、扉に短いリード文や献辞が
+# 乗っていても扉と認められる値として 100 字を採る
+# （p13 の「平井靖史」のような扉の添え物は kind=raw なので para には入らない）。
 PART_TITLE_PAGE_MAX_CHARS = 100
 
 
 def _page_para_chars(blocks: list[dict]) -> dict[int, int]:
-    """ページ番号 → そのページの本文 para の総字数"""
+    """ページ番号 → そのページの本文 para の総字数（正規化前の生の OCR テキストで数える）"""
 
     chars: dict[int, int] = {}
     for b in blocks:
@@ -456,26 +458,42 @@ def demote_false_part_headings(blocks: list[dict]) -> list[dict]:
     だけを降格する。部扉を立てず本文の頭に部名を置く体裁の本では条件が成立せず、何もし
     ない（判断材料が無いので触らない）。
 
-    部番号でグループ化しないのは、番号そのものが OCR のいちばん外しやすい部分だから。
-    実測では PDF のテキスト層が無いと book_ir.fix_bu_numerals() が働かず、
-    『時間を哲学する』の p103（第Ⅱ部）と p252（第Ⅲ部）が両方とも「第Ⅰ部」と読まれる。
-    番号を鍵にすると、その本では第Ⅱ部のグループが偽の見出し 1 件だけになり降格できない。
+    比較する範囲は部番号の信頼度で切り替える。部番号は OCR のいちばん外しやすい部分で、
+    PDF のテキスト層が無いと book_ir.fix_bu_numerals() が働かず、『時間を哲学する』の
+    p103（第Ⅱ部）と p252（第Ⅲ部）が両方とも「第Ⅰ部」と読まれる（実測）。そこで
+      - 扉ごとに番号が区別できている（＝扉の数と扉の部番号の種類数が一致する）とき
+        … 同じ部番号どうしで比較する。他の部の扉の薄さを根拠に、扉に献辞やエピグラフを
+          置く体裁の部を降格してしまう事故を防ぐ
+      - 番号が潰れているとき … 本全体を 1 グループとして比較する（番号を鍵にすると、
+        『時間を哲学する』では第Ⅱ部のグループが偽の見出し 1 件だけになり降格できない）
+    既知の限界: 番号が潰れていて、かつ扉のスタイルが混在する本では、本文の乗った本物の
+    扉を降格しうる。両方が同時に成立つ本は実データで見ていない。
     """
 
     para_chars = _page_para_chars(blocks)
-    bu_pages: list[tuple[int, int]] = []  # (blocks の index, ページの本文字数)
+    # (blocks の index, 部番号, そのページの本文字数)
+    bu_headings: list[tuple[int, str, int]] = []
     for i, b in enumerate(blocks):
         if b["kind"] != "heading" or b["level"] != "大" or b.get("page") is None:
             continue
-        if BU_HEADING_RE.match(heading_title(b["lines"])):
-            bu_pages.append((i, para_chars.get(b["page"], 0)))
+        m = BU_HEADING_RE.match(heading_title(b["lines"]))
+        if m:
+            bu_headings.append((i, m.group(0), para_chars.get(b["page"], 0)))
 
-    if len(bu_pages) < 2:
-        return blocks
-    if not any(chars <= PART_TITLE_PAGE_MAX_CHARS for _, chars in bu_pages):
+    if len(bu_headings) < 2:
         return blocks
 
-    demoted = {i for i, chars in bu_pages if chars > PART_TITLE_PAGE_MAX_CHARS}
+    title_pages = [(num, chars) for _, num, chars in bu_headings if chars <= PART_TITLE_PAGE_MAX_CHARS]
+    if not title_pages:
+        return blocks
+
+    title_numbers = {num for num, _ in title_pages}
+    numbers_are_reliable = len(title_numbers) == len(title_pages)
+    demoted = {
+        i
+        for i, num, chars in bu_headings
+        if chars > PART_TITLE_PAGE_MAX_CHARS and (not numbers_are_reliable or num in title_numbers)
+    }
     if not demoted:
         return blocks
 
@@ -534,6 +552,11 @@ def split_chapters_and_nav(blocks: list[dict]) -> tuple[list[dict], list[dict]]:
             # 2 章）。直前の大見出しとタイトルが同じなら章も nav ノードも増やさず、重複した
             # 見出しブロックだけを捨てて直前の章に統合する。捨てるのは見出しブロックだけで、
             # 後続の本文ブロックはそのまま直前の章へ入る。
+            #
+            # 既知の限界: タイトルが同じでも中身が別の節（複数人の「解説」が続き、見出し
+            # ブロックに執筆者名が入らなかった場合など）は 2 件目の見出しが消え、2 つの節が
+            # 見出し無しで連結される。内容は失われないが節の切れ目は見えなくなる。
+            # test_nav_structure.py がこの挙動を固定しているので、変えるならそこも読むこと。
             if title and title == last_major_title and current_chapter is not None:
                 continue
 
